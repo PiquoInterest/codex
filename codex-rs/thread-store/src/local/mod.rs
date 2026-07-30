@@ -68,6 +68,7 @@ use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
 use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
+use crate::local::thread_history_materialization::RolloutHeadInfo;
 use crate::local::writer_lock::WriterLockCoordinator;
 use crate::local::writer_lock::WriterLockGuard;
 
@@ -92,6 +93,11 @@ pub struct LocalThreadStore {
     writer_lock_coordinator: Arc<WriterLockCoordinator>,
     state_db: Option<StateDbHandle>,
     thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
+    // The SessionMeta head line is written once per rollout file and never
+    // rewritten in place, so the projection-relevant head values are cached
+    // per thread instead of re-reading (and re-parsing base_instructions and
+    // dynamic tool schemas) on every durable append.
+    rollout_head_cache: Arc<Mutex<HashMap<ThreadId, (PathBuf, RolloutHeadInfo)>>>,
 }
 
 struct LiveRecorderEntry {
@@ -200,12 +206,17 @@ impl LocalThreadStore {
             writer_lock_coordinator,
             state_db,
             thread_history_db: Arc::new(OnceCell::new()),
+            rollout_head_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
         self.state_db.clone()
+    }
+
+    pub(super) async fn evict_rollout_head_cache(&self, thread_id: ThreadId) {
+        self.rollout_head_cache.lock().await.remove(&thread_id);
     }
 
     async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {

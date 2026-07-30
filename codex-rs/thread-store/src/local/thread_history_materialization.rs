@@ -21,6 +21,50 @@ struct CompleteRolloutLine {
     end_byte_offset: u64,
 }
 
+/// Projection-relevant values from a rollout file's SessionMeta head line.
+///
+/// The head line is written once when the rollout file is created and never
+/// rewritten in place, so these values are immutable per (thread, path) and
+/// safe to cache for the lifetime of the live writer.
+#[derive(Clone, Copy)]
+pub(super) struct RolloutHeadInfo {
+    initial_ordinal: u64,
+    subagent_history_start_ordinal: Option<u64>,
+}
+
+/// Reads the SessionMeta head values through the store-level cache. The head
+/// line embeds the full base instructions and dynamic tool schemas, so parsing
+/// it on every durable append is wasteful; entries are evicted when the live
+/// writer closes or the thread is deleted, and a rollout-path mismatch forces
+/// a re-read.
+async fn rollout_head_info(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+) -> ThreadStoreResult<RolloutHeadInfo> {
+    if let Some((cached_path, info)) = store.rollout_head_cache.lock().await.get(&thread_id)
+        && cached_path == rollout_path
+    {
+        return Ok(*info);
+    }
+    let session_meta = codex_rollout::read_session_meta_line(rollout_path)
+        .await
+        .map_err(thread_store_io_error)?
+        .meta;
+    let info = RolloutHeadInfo {
+        initial_ordinal: session_meta
+            .history_base
+            .map_or(0, |base| base.end_ordinal_exclusive),
+        subagent_history_start_ordinal: session_meta.subagent_history_start_ordinal,
+    };
+    store
+        .rollout_head_cache
+        .lock()
+        .await
+        .insert(thread_id, (rollout_path.to_path_buf(), info));
+    Ok(info)
+}
+
 pub(super) async fn materialize_to_sqlite(
     store: &LocalThreadStore,
     thread_id: ThreadId,
@@ -37,14 +81,10 @@ pub(super) async fn materialize_to_sqlite(
     if lines.is_empty() && start_offset == next_offset {
         return Ok(());
     }
-    let session_meta = codex_rollout::read_session_meta_line(rollout_path)
-        .await
-        .map_err(thread_store_io_error)?
-        .meta;
-    let initial_ordinal = session_meta
-        .history_base
-        .map_or(0, |base| base.end_ordinal_exclusive);
-    let subagent_history_start_ordinal = session_meta.subagent_history_start_ordinal;
+    let RolloutHeadInfo {
+        initial_ordinal,
+        subagent_history_start_ordinal,
+    } = rollout_head_info(store, thread_id, rollout_path).await?;
 
     let projections = lines
         .iter()

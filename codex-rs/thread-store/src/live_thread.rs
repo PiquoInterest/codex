@@ -240,12 +240,17 @@ impl LiveThread {
         } else {
             (persisted_rollout_items(raw_items, self.history_mode), None)
         };
-        self.thread_store
-            .append_items(AppendThreadItemsParams {
-                thread_id: self.thread_id,
-                items: raw_items.to_vec(),
-            })
-            .await?;
+        // Send the already-filtered items so the store round trip is skipped
+        // when the whole batch is non-persistable; the store re-applies the
+        // same policy, which is idempotent on a filtered batch.
+        if !items.is_empty() {
+            self.thread_store
+                .append_items(AppendThreadItemsParams {
+                    thread_id: self.thread_id,
+                    items: items.clone(),
+                })
+                .await?;
+        }
         if let Some(measurement) = measurement.as_ref() {
             self.persistence_telemetry
                 .record_batch(raw_items, measurement);

@@ -178,6 +178,7 @@ pub(super) async fn shutdown_thread(
         let _ = metrics.histogram(ROLLOUT_SIZE_BYTES_METRIC, size_bytes, &[]);
     }
     store.live_recorders.lock().await.remove(&thread_id);
+    store.evict_rollout_head_cache(thread_id).await;
     Ok(())
 }
 
@@ -186,6 +187,7 @@ pub(super) async fn discard_thread(
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    store.evict_rollout_head_cache(thread_id).await;
     store
         .live_recorders
         .lock()

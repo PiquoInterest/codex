@@ -2066,7 +2066,9 @@ impl Session {
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
         // Persist the event into rollout storage; the store applies its persistence policy.
-        if persist {
+        // Events no history mode persists (e.g. per-token streaming deltas) skip the
+        // clone and thread-store round trip entirely to keep the delta path cheap.
+        if persist && codex_rollout::is_event_msg_ever_persisted(&event.msg) {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
             self.persist_rollout_items(&rollout_items).await;
         }

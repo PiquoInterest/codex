@@ -156,6 +156,7 @@ async fn delete_thread_after_reference_check(
     }
     super::thread_history::delete_thread(store, thread_id).await?;
 
+    store.evict_rollout_head_cache(thread_id).await;
     // Drop the recorder before removing files, but retain its writer lock until cleanup finishes.
     if let Some(writer_lock) = store
         .live_recorders
