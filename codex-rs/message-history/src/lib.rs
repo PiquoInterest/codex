@@ -16,8 +16,6 @@
 
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::BufRead;
-use std::io::BufReader;
 use std::io::Read;
 use std::io::Result;
 use std::io::Seek;
@@ -209,55 +207,58 @@ fn enforce_history_limit(file: &mut File, max_bytes: Option<usize>) -> Result<()
         Err(_) => return Ok(()),
     };
 
-    let mut current_len = file.metadata()?.len();
+    let current_len = file.metadata()?.len();
 
     if current_len <= max_bytes {
         return Ok(());
     }
 
-    let mut reader_file = file.try_clone()?;
-    reader_file.seek(SeekFrom::Start(0))?;
+    let mut reader = file.try_clone()?;
 
-    let mut buf_reader = BufReader::new(reader_file);
-    let mut line_lengths = Vec::new();
-    let mut line_buf = String::new();
-
-    loop {
-        line_buf.clear();
-
-        let bytes = buf_reader.read_line(&mut line_buf)?;
-
-        if bytes == 0 {
-            break;
-        }
-
-        line_lengths.push(bytes as u64);
-    }
-
-    if line_lengths.is_empty() {
+    // Locate the newest entry with a bounded backward scan instead of reading
+    // the whole file forward line by line; only the newest entry's length
+    // matters for the trim target.
+    let newest_start = last_line_start(&mut reader, current_len)?;
+    let trim_target = trim_target_bytes(max_bytes, current_len - newest_start);
+    let excess = current_len.saturating_sub(trim_target);
+    if excess == 0 || newest_start == 0 {
         return Ok(());
     }
 
-    let last_index = line_lengths.len() - 1;
-    let trim_target = trim_target_bytes(max_bytes, line_lengths[last_index]);
-
-    let mut drop_bytes = 0u64;
-    let mut idx = 0usize;
-
-    while current_len > trim_target && idx < last_index {
-        current_len = current_len.saturating_sub(line_lengths[idx]);
-        drop_bytes += line_lengths[idx];
-        idx += 1;
+    // Scan newline boundaries forward over only the oldest entries, stopping
+    // at the first boundary that discards at least `excess` bytes. The newest
+    // entry is never dropped; when every older entry is too small the whole
+    // older prefix goes. Boundaries are byte-defined, so unlike the previous
+    // whole-file `read_line` pass this does not validate (or fail on) invalid
+    // UTF-8 in entries that are about to be discarded.
+    let mut drop_bytes = newest_start;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; HISTORY_READ_BUFFER_SIZE];
+    let mut pos = 0u64;
+    'scan: while pos < newest_start {
+        let want = usize::try_from((newest_start - pos).min(HISTORY_READ_BUFFER_SIZE as u64))
+            .unwrap_or(HISTORY_READ_BUFFER_SIZE);
+        let read = reader.read(&mut buf[..want])?;
+        if read == 0 {
+            break;
+        }
+        for offset in memchr_iter(b'\n', &buf[..read]) {
+            let line_end = pos + offset as u64 + 1;
+            if line_end >= excess {
+                drop_bytes = line_end;
+                break 'scan;
+            }
+        }
+        pos += read as u64;
     }
 
     if drop_bytes == 0 {
         return Ok(());
     }
 
-    let mut reader = buf_reader.into_inner();
     reader.seek(SeekFrom::Start(drop_bytes))?;
 
-    let capacity = usize::try_from(current_len).unwrap_or(0);
+    let capacity = usize::try_from(current_len.saturating_sub(drop_bytes)).unwrap_or(0);
     let mut tail = Vec::with_capacity(capacity);
 
     reader.read_to_end(&mut tail)?;
@@ -268,6 +269,36 @@ fn enforce_history_limit(file: &mut File, max_bytes: Option<usize>) -> Result<()
     file.flush()?;
 
     Ok(())
+}
+
+/// Returns the byte offset where the newest entry begins, scanning backward in
+/// bounded chunks. A single trailing newline terminates the newest entry
+/// rather than starting an empty one, matching `read_line` semantics.
+fn last_line_start(file: &mut File, len: u64) -> Result<u64> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut buf = vec![0u8; HISTORY_READ_BUFFER_SIZE];
+    let mut end = len;
+    let mut first_chunk = true;
+    while end > 0 {
+        let start = end.saturating_sub(HISTORY_READ_BUFFER_SIZE as u64);
+        let chunk_len = usize::try_from(end - start).unwrap_or(HISTORY_READ_BUFFER_SIZE);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..chunk_len])?;
+        let mut search_end = chunk_len;
+        if first_chunk {
+            if buf[chunk_len - 1] == b'\n' {
+                search_end -= 1;
+            }
+            first_chunk = false;
+        }
+        if let Some(idx) = memchr::memrchr(b'\n', &buf[..search_end]) {
+            return Ok(start + idx as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 fn trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64 {

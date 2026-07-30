@@ -218,3 +218,165 @@ async fn append_entry_trims_history_to_soft_cap() {
     assert_eq!(pruned_len, long_entry_len);
     assert!(pruned_len <= soft_cap_bytes.max(long_entry_len));
 }
+
+/// Reference implementation of the trim algorithm this crate used before the
+/// streaming scan: read every line's length forward, then drop oldest lines
+/// until the remainder fits the target.
+fn reference_enforce_history_limit(file: &mut File, max_bytes: u64) -> std::io::Result<()> {
+    use std::io::BufRead;
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
+    let mut current_len = file.metadata()?.len();
+    if current_len <= max_bytes {
+        return Ok(());
+    }
+    let mut reader_file = file.try_clone()?;
+    reader_file.seek(SeekFrom::Start(0))?;
+    let mut buf_reader = std::io::BufReader::new(reader_file);
+    let mut line_lengths = Vec::new();
+    let mut line_buf = String::new();
+    loop {
+        line_buf.clear();
+        let bytes = buf_reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+        line_lengths.push(bytes as u64);
+    }
+    if line_lengths.is_empty() {
+        return Ok(());
+    }
+    let last_index = line_lengths.len() - 1;
+    let trim_target = trim_target_bytes(max_bytes, line_lengths[last_index]);
+    let mut drop_bytes = 0u64;
+    let mut idx = 0usize;
+    while current_len > trim_target && idx < last_index {
+        current_len = current_len.saturating_sub(line_lengths[idx]);
+        drop_bytes += line_lengths[idx];
+        idx += 1;
+    }
+    if drop_bytes == 0 {
+        return Ok(());
+    }
+    let mut reader = buf_reader.into_inner();
+    reader.seek(SeekFrom::Start(drop_bytes))?;
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&tail)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn run_trim(
+    dir: &TempDir,
+    name: &str,
+    contents: &[u8],
+    max_bytes: usize,
+    streaming: bool,
+) -> Vec<u8> {
+    let path = dir.path().join(name);
+    std::fs::write(&path, contents).expect("write corpus");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open corpus");
+    if streaming {
+        enforce_history_limit(&mut file, Some(max_bytes)).expect("streaming trim");
+    } else {
+        reference_enforce_history_limit(&mut file, max_bytes as u64).expect("reference trim");
+    }
+    std::fs::read(&path).expect("read trimmed")
+}
+
+/// The streaming trim must produce byte-identical files to the previous
+/// line-lengths algorithm across edge shapes: multibyte UTF-8, unterminated
+/// final entries, oversized newest entries, tiny caps, and boundary caps.
+#[test]
+fn streaming_trim_matches_reference_implementation() {
+    let dir = TempDir::new().expect("create temp dir");
+
+    let mut corpora: Vec<Vec<u8>> = vec![
+        b"a\n".to_vec(),
+        b"a\nb\n".to_vec(),
+        b"a\nb".to_vec(),
+        b"\n".to_vec(),
+        b"\n\n\n\n".to_vec(),
+        b"one giant line without newline".to_vec(),
+        b"one giant line with newline\n".to_vec(),
+        "caf\u{e9}\n\u{1f600}\u{1f600}\u{1f600}\n\u{4e16}\u{754c}\n"
+            .as_bytes()
+            .to_vec(),
+        b"tiny\nhuge-newest-entry-larger-than-the-cap-itself-so-it-must-be-retained\n".to_vec(),
+    ];
+
+    // Deterministic LCG so failures reproduce; varied line lengths including
+    // empty lines and a possibly unterminated tail.
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+    for _ in 0..40 {
+        let lines = next() % 30 + 1;
+        let mut corpus = Vec::new();
+        for line_idx in 0..lines {
+            let len = next() % 60;
+            let unit = ["x", "\u{e9}", "\u{1f600}"][next() % 3];
+            let mut line = unit.repeat(len);
+            line.push('\n');
+            if line_idx + 1 == lines && next() % 3 == 0 {
+                line.pop();
+                if line.is_empty() {
+                    line.push('x');
+                }
+            }
+            corpus.extend_from_slice(line.as_bytes());
+        }
+        corpora.push(corpus);
+    }
+
+    let mut compared = 0usize;
+    for (corpus_idx, corpus) in corpora.iter().enumerate() {
+        for max_bytes in [1usize, 2, 3, 5, 8, 16, 40, 64, 200] {
+            let reference = run_trim(
+                &dir,
+                &format!("ref-{corpus_idx}-{max_bytes}"),
+                corpus,
+                max_bytes,
+                false,
+            );
+            let streaming = run_trim(
+                &dir,
+                &format!("new-{corpus_idx}-{max_bytes}"),
+                corpus,
+                max_bytes,
+                true,
+            );
+            assert_eq!(
+                reference, streaming,
+                "corpus {corpus_idx} with max_bytes {max_bytes} diverged",
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 400, "expected a meaningful comparison matrix");
+}
+
+/// Byte-defined boundaries mean invalid UTF-8 in discarded entries no longer
+/// aborts the trim; the newest entry is still retained verbatim.
+#[test]
+fn streaming_trim_tolerates_invalid_utf8_in_dropped_prefix() {
+    let dir = TempDir::new().expect("create temp dir");
+    let mut corpus = vec![0xffu8, 0xfe, 0xfd];
+    corpus.push(b'\n');
+    corpus.extend_from_slice(b"newest\n");
+    let trimmed = run_trim(&dir, "invalid-utf8", &corpus, 8, true);
+    assert_eq!(trimmed, b"newest\n");
+}
