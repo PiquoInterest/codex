@@ -98,11 +98,7 @@ impl RowBuilder {
         }
         let to_commit = display_count - max_keep;
         let commit_count = to_commit.min(self.rows.len());
-        let mut drained = Vec::with_capacity(commit_count);
-        for _ in 0..commit_count {
-            drained.push(self.rows.remove(0));
-        }
-        drained
+        self.rows.drain(..commit_count).collect()
     }
 
     fn flush_current_line(&mut self, explicit_break: bool) {
