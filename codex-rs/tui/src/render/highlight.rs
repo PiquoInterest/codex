@@ -746,33 +746,34 @@ fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'stati
     let theme_revision = syntax_theme_revision();
     let highlighter = Highlighter::new(&theme_guard);
 
-    let resumed = HIGHLIGHT_PREFIX_CACHE.with_borrow(|cache| {
-        cache
-            .as_ref()
-            .filter(|entry| {
-                entry.lang == lang
-                    && entry.theme_revision == theme_revision
-                    && entry.prefix.ends_with('\n')
-                    && code.starts_with(entry.prefix.as_str())
-            })
-            .map(|entry| {
-                (
-                    entry.prefix.len(),
-                    entry.lines.clone(),
-                    entry.parse_state.clone(),
-                    entry.highlight_state.clone(),
-                )
-            })
-    });
-    let (prefix_len, mut lines, mut parse_state, mut highlight_state) =
-        resumed.unwrap_or_else(|| {
-            (
-                0,
-                Vec::new(),
-                ParseState::new(syntax),
-                HighlightState::new(&highlighter, ScopeStack::new()),
-            )
+    // Take a matching entry so its accumulated rows move into this render
+    // instead of being cloned (a hit leaves the slot empty until the refreshed
+    // snapshot is stored below; a mismatched entry stays put and is
+    // overwritten at store time).
+    let cached = HIGHLIGHT_PREFIX_CACHE.with_borrow_mut(|cache| {
+        let matches = cache.as_ref().is_some_and(|entry| {
+            entry.lang == lang
+                && entry.theme_revision == theme_revision
+                && entry.prefix.ends_with('\n')
+                && code.starts_with(entry.prefix.as_str())
         });
+        if matches { cache.take() } else { None }
+    });
+    let (mut prefix, mut lines, mut parse_state, mut highlight_state) = match cached {
+        Some(entry) => (
+            entry.prefix,
+            entry.lines,
+            entry.parse_state,
+            entry.highlight_state,
+        ),
+        None => (
+            String::new(),
+            Vec::new(),
+            ParseState::new(syntax),
+            HighlightState::new(&highlighter, ScopeStack::new()),
+        ),
+    };
+    let prefix_len = prefix.len();
 
     // Highlight through the last complete line, snapshot the resumable state
     // at that boundary, then finish any partial trailing line.
@@ -783,30 +784,35 @@ fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'stati
         &highlighter,
         &mut lines,
     )?;
-    let prefix_lines = lines.clone();
     let prefix_parse_state = parse_state.clone();
     let prefix_highlight_state = highlight_state.clone();
 
+    // One prefix copy per render is inherent -- the caller owns the returned
+    // rows while the cache retains the prefix snapshot. The caller gets the
+    // exact-size clone; the cache keeps the original vec and its amortized
+    // capacity, and the prefix string grows in place by only the new bytes.
+    let mut result = lines.clone();
     append_highlighted_lines(
         &code[complete_len..],
         &mut parse_state,
         &mut highlight_state,
         &highlighter,
-        &mut lines,
+        &mut result,
     )?;
+    prefix.push_str(&code[prefix_len..complete_len]);
 
     HIGHLIGHT_PREFIX_CACHE.with_borrow_mut(|cache| {
         *cache = Some(HighlightPrefixCache {
             lang: lang.to_string(),
             theme_revision,
-            prefix: code[..complete_len].to_string(),
+            prefix,
             parse_state: prefix_parse_state,
             highlight_state: prefix_highlight_state,
-            lines: prefix_lines,
+            lines,
         });
     });
 
-    Some(lines)
+    Some(result)
 }
 
 // -- Public API ---------------------------------------------------------------
