@@ -1276,8 +1276,17 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> Option<i64> {
-        let history = self.clone_history().await;
-        history.estimate_token_count(turn_context)
+        // The estimate is a read-only walk; summing lengths under the state
+        // lock is cheaper than deep-cloning the history to release it sooner.
+        self.with_history(|history| history.estimate_token_count(turn_context))
+            .await
+    }
+
+    /// Runs `f` against the live history under the state lock, for read-only
+    /// walks that do not justify deep-cloning the history.
+    pub(crate) async fn with_history<R>(&self, f: impl FnOnce(&ContextManager) -> R) -> R {
+        let state = self.state.lock().await;
+        f(&state.history)
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
