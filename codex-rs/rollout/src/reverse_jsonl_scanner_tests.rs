@@ -139,6 +139,15 @@ fn scans_across_read_chunk_boundaries() -> std::io::Result<()> {
 }
 
 #[test]
+fn returns_none_for_whitespace_only_unterminated_file() -> std::io::Result<()> {
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(b"  \t"))?;
+
+    assert!(scanner.scan_next::<TestRecord>()?.is_none());
+    assert!(scanner.scan_next::<TestRecord>()?.is_none());
+    Ok(())
+}
+
+#[test]
 fn scans_record_spanning_three_read_chunks() -> std::io::Result<()> {
     let large_value = "x".repeat(super::READ_CHUNK_SIZE * 2);
     let input = format!(

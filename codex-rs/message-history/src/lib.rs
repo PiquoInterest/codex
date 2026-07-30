@@ -32,7 +32,6 @@ use serde::Serialize;
 
 use std::time::Duration;
 use tokio::fs;
-use tokio::io::AsyncReadExt;
 
 use codex_config::types::History;
 use codex_config::types::HistoryPersistence;
@@ -50,7 +49,7 @@ use std::os::unix::fs::PermissionsExt;
 
 /// Filename that stores the message history inside `~/.codex`.
 const HISTORY_FILENAME: &str = "history.jsonl";
-const HISTORY_READ_BUFFER_SIZE: usize = 8192;
+const HISTORY_READ_BUFFER_SIZE: usize = 256 * 1024;
 
 /// When history exceeds the hard cap, trim it down to this fraction of `max_bytes`.
 const HISTORY_SOFT_CAP_RATIO: f64 = 0.8;
@@ -331,24 +330,28 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
         Err(_) => return (0, 0),
     };
 
-    // Open the file.
-    let mut file = match fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return (log_id, 0),
-    };
+    let path = path.to_path_buf();
+    let count = tokio::task::spawn_blocking(move || {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
 
-    // Count newline bytes.
-    let mut buf = [0u8; HISTORY_READ_BUFFER_SIZE];
-    let mut count = 0usize;
-    loop {
-        match file.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                count += memchr_iter(b'\n', &buf[..n]).count();
+        let mut buf = vec![0u8; HISTORY_READ_BUFFER_SIZE];
+        let mut count = 0usize;
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    count += memchr_iter(b'\n', &buf[..n]).count();
+                }
+                Err(_) => return 0,
             }
-            Err(_) => return (log_id, 0),
         }
-    }
+        count
+    })
+    .await
+    .unwrap_or(0);
 
     (log_id, count)
 }

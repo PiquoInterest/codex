@@ -978,9 +978,9 @@ impl RolloutRecorder {
                 })
             })?;
         rx.await.map_err(|e| {
-            self.writer_task.terminal_failure().unwrap_or_else(|| {
-                IoError::other(format!("failed waiting for rollout flush: {e}"))
-            })
+            self.writer_task
+                .terminal_failure()
+                .unwrap_or_else(|| IoError::other(format!("failed waiting for rollout flush: {e}")))
         })?
     }
 

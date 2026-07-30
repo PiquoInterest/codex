@@ -77,14 +77,24 @@ where
                 self.chunk_position = read_size;
             }
 
-            let chunk = &self.chunk[..self.chunk_position];
+            let record_end = self.chunk_position;
+            let chunk = &self.chunk[..record_end];
             if let Some(newline_position) = chunk.iter().rposition(|byte| *byte == b'\n') {
-                self.record_reversed
-                    .extend(chunk[newline_position + 1..].iter().rev().copied());
                 self.chunk_position = newline_position;
-                if let Some(outcome) = self.finish_record() {
-                    return Ok(Some(outcome));
+                if self.record_reversed.is_empty() {
+                    if let Some(outcome) = parse_record(&chunk[newline_position + 1..]) {
+                        return Ok(Some(outcome));
+                    }
+                } else {
+                    self.record_reversed
+                        .extend(chunk[newline_position + 1..].iter().rev().copied());
+                    if let Some(outcome) = self.finish_record() {
+                        return Ok(Some(outcome));
+                    }
                 }
+            } else if self.next_chunk_end == 0 && self.record_reversed.is_empty() {
+                self.chunk_position = 0;
+                return Ok(parse_record(chunk));
             } else {
                 self.record_reversed.extend(chunk.iter().rev().copied());
                 self.chunk_position = 0;
@@ -97,16 +107,23 @@ where
         T: DeserializeOwned,
     {
         self.record_reversed.reverse();
-        let outcome = if self.record_reversed.iter().all(u8::is_ascii_whitespace) {
-            None
-        } else {
-            Some(match serde_json::from_slice::<T>(&self.record_reversed) {
-                Ok(value) => ScanOutcome::Parsed(value),
-                Err(error) => ScanOutcome::Rejected(error),
-            })
-        };
+        let outcome = parse_record(&self.record_reversed);
         self.record_reversed.clear();
         outcome
+    }
+}
+
+fn parse_record<T>(record: &[u8]) -> Option<ScanOutcome<T>>
+where
+    T: DeserializeOwned,
+{
+    if record.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        Some(match serde_json::from_slice::<T>(record) {
+            Ok(value) => ScanOutcome::Parsed(value),
+            Err(error) => ScanOutcome::Rejected(error),
+        })
     }
 }
 

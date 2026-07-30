@@ -22,12 +22,18 @@
 //! individual line longer than 4 KiB, are rejected early (returns `None`) to
 //! prevent pathological CPU/memory usage.  Callers must fall back to plain
 //! unstyled text.
+//!
+//! **Incremental highlighting:** streamed markdown re-renders a growing code
+//! block on every commit, so a thread-local single-slot memo
+//! ([`HIGHLIGHT_PREFIX_CACHE`]) keeps the syntect states for the last
+//! `'\n'`-terminated prefix and each re-render highlights only the new suffix.
 
 use ratatui::style::Color as RtColor;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use std::cell::RefCell;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -37,11 +43,15 @@ use std::sync::atomic::Ordering;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Color as SyntectColor;
 use syntect::highlighting::FontStyle;
+use syntect::highlighting::HighlightIterator;
+use syntect::highlighting::HighlightState;
 use syntect::highlighting::Highlighter;
 use syntect::highlighting::Style as SyntectStyle;
 use syntect::highlighting::Theme;
 use syntect::highlighting::ThemeSet;
+use syntect::parsing::ParseState;
 use syntect::parsing::Scope;
+use syntect::parsing::ScopeStack;
 use syntect::parsing::SyntaxReference;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
@@ -249,6 +259,9 @@ pub(crate) fn set_syntax_theme(theme: Theme) {
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = theme;
+    // Bump while the write lock is still held so a revision read under the
+    // read lock always matches the guarded theme; the incremental prefix
+    // cache relies on that pairing to stay coherent.
     THEME_REVISION.fetch_add(1, Ordering::Release);
 }
 
@@ -594,13 +607,42 @@ pub(crate) fn exceeds_highlight_limits(total_bytes: usize, total_lines: usize) -
     total_bytes > MAX_HIGHLIGHT_BYTES || total_lines > MAX_HIGHLIGHT_LINES
 }
 
+/// Check a full input against every guardrail, including the per-line length
+/// limit.  Counts actual lines (not newline bytes) to avoid an off-by-one when
+/// the input does not end with a newline.
+fn exceeds_highlight_guardrails(code: &str) -> bool {
+    exceeds_highlight_limits(code.len(), code.lines().count())
+        || code
+            .lines()
+            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+}
+
 // -- Core highlighting --------------------------------------------------------
 
-/// Core highlighter that accepts an explicit theme reference.
+/// Convert one highlighted line's `(style, text)` ranges into ratatui spans.
+fn line_spans_from_ranges(ranges: Vec<(SyntectStyle, &str)>) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (style, text) in ranges {
+        // Strip trailing line endings (LF and CR) since we handle line
+        // breaks ourselves.  CRLF inputs would otherwise leave a stray \r.
+        let text = text.trim_end_matches(['\n', '\r']);
+        if text.is_empty() {
+            continue;
+        }
+        spans.push(Span::styled(text.to_string(), convert_style(style)));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
+}
+
+/// Core from-scratch highlighter that accepts an explicit theme reference.
 ///
-/// This keeps production behavior and test behavior on the same code path:
-/// production callers pass the global theme lock, while tests can pass a
-/// concrete theme without mutating process-global state.
+/// This is the uncached reference path: [`highlight_to_line_spans`] delegates
+/// here when there is no complete line to memoize, and tests compare its
+/// output against the incremental prefix-cache path, which must render
+/// identical spans.
 fn highlight_to_line_spans_with_theme(
     code: &str,
     lang: &str,
@@ -613,14 +655,7 @@ fn highlight_to_line_spans_with_theme(
     }
 
     // Bail out early for oversized inputs to avoid excessive resource usage.
-    // Count actual lines (not newline bytes) to avoid an off-by-one when
-    // the input does not end with a newline.
-    if code.len() > MAX_HIGHLIGHT_BYTES
-        || code.lines().count() > MAX_HIGHLIGHT_LINES
-        || code
-            .lines()
-            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
-    {
+    if exceeds_highlight_guardrails(code) {
         return None;
     }
 
@@ -630,34 +665,148 @@ fn highlight_to_line_spans_with_theme(
 
     for line in LinesWithEndings::from(code) {
         let ranges = h.highlight_line(line, syntax_set()).ok()?;
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for (style, text) in ranges {
-            // Strip trailing line endings (LF and CR) since we handle line
-            // breaks ourselves.  CRLF inputs would otherwise leave a stray \r.
-            let text = text.trim_end_matches(['\n', '\r']);
-            if text.is_empty() {
-                continue;
-            }
-            spans.push(Span::styled(text.to_string(), convert_style(style)));
-        }
-        if spans.is_empty() {
-            spans.push(Span::raw(String::new()));
-        }
-        lines.push(spans);
+        lines.push(line_spans_from_ranges(ranges));
     }
 
     Some(lines)
 }
 
+/// Highlight one segment of the input line by line, appending one spans row
+/// per line while advancing `parse_state`/`highlight_state` across it.
+///
+/// `segment` must start at a line boundary.  Together with
+/// [`line_spans_from_ranges`] this is exactly what
+/// `HighlightLines::highlight_line` does internally, so output resumed from
+/// cached states is identical to a from-scratch render.
+fn append_highlighted_lines(
+    segment: &str,
+    parse_state: &mut ParseState,
+    highlight_state: &mut HighlightState,
+    highlighter: &Highlighter<'_>,
+    lines: &mut Vec<Vec<Span<'static>>>,
+) -> Option<()> {
+    for line in LinesWithEndings::from(segment) {
+        let ops = parse_state.parse_line(line, syntax_set()).ok()?;
+        let ranges = HighlightIterator::new(highlight_state, &ops, line, highlighter).collect();
+        lines.push(line_spans_from_ranges(ranges));
+    }
+    Some(())
+}
+
+/// Resumable snapshot of the most recent highlight: rendered spans for a
+/// `'\n'`-terminated prefix plus the syntect states needed to continue
+/// highlighting after it.
+///
+/// Streamed markdown re-renders a growing code block on every commit; resuming
+/// from the previous prefix makes each re-render cost only the new suffix
+/// instead of re-parsing the whole block (quadratic over a stream).
+struct HighlightPrefixCache {
+    lang: String,
+    theme_revision: u64,
+    prefix: String,
+    parse_state: ParseState,
+    highlight_state: HighlightState,
+    lines: Vec<Vec<Span<'static>>>,
+}
+
+thread_local! {
+    // Single-slot and thread-local: the TUI highlights from one render thread,
+    // and syntect's `ParseState` is not `Send` with the onig backend, which
+    // rules out a process-global `Mutex` slot.
+    static HIGHLIGHT_PREFIX_CACHE: RefCell<Option<HighlightPrefixCache>> =
+        const { RefCell::new(None) };
+}
+
 /// Parse `code` using syntect for `lang` and return per-line styled spans.
 /// Each inner Vec represents one source line.  Returns None when the language
 /// is not recognized or the input exceeds safety limits.
+///
+/// Resumes from [`HIGHLIGHT_PREFIX_CACHE`] when `code` extends the previously
+/// highlighted input, so re-rendering a growing streamed code block costs one
+/// suffix highlight per call instead of a full re-parse.
 fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'static>>>> {
     let theme_guard = match theme_lock().read() {
         Ok(theme_guard) => theme_guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    highlight_to_line_spans_with_theme(code, lang, &theme_guard)
+
+    // Inputs without a complete '\n'-terminated line cannot seed or extend the
+    // prefix memo; highlight them from scratch.
+    let Some(last_newline) = code.rfind('\n') else {
+        return highlight_to_line_spans_with_theme(code, lang, &theme_guard);
+    };
+    let complete_len = last_newline + 1;
+
+    if exceeds_highlight_guardrails(code) {
+        return None;
+    }
+    let syntax = find_syntax(lang)?;
+    // set_syntax_theme bumps the revision while still holding the write lock,
+    // so a revision read under this read lock matches the guarded theme.
+    let theme_revision = syntax_theme_revision();
+    let highlighter = Highlighter::new(&theme_guard);
+
+    let resumed = HIGHLIGHT_PREFIX_CACHE.with_borrow(|cache| {
+        cache
+            .as_ref()
+            .filter(|entry| {
+                entry.lang == lang
+                    && entry.theme_revision == theme_revision
+                    && entry.prefix.ends_with('\n')
+                    && code.starts_with(entry.prefix.as_str())
+            })
+            .map(|entry| {
+                (
+                    entry.prefix.len(),
+                    entry.lines.clone(),
+                    entry.parse_state.clone(),
+                    entry.highlight_state.clone(),
+                )
+            })
+    });
+    let (prefix_len, mut lines, mut parse_state, mut highlight_state) =
+        resumed.unwrap_or_else(|| {
+            (
+                0,
+                Vec::new(),
+                ParseState::new(syntax),
+                HighlightState::new(&highlighter, ScopeStack::new()),
+            )
+        });
+
+    // Highlight through the last complete line, snapshot the resumable state
+    // at that boundary, then finish any partial trailing line.
+    append_highlighted_lines(
+        &code[prefix_len..complete_len],
+        &mut parse_state,
+        &mut highlight_state,
+        &highlighter,
+        &mut lines,
+    )?;
+    let prefix_lines = lines.clone();
+    let prefix_parse_state = parse_state.clone();
+    let prefix_highlight_state = highlight_state.clone();
+
+    append_highlighted_lines(
+        &code[complete_len..],
+        &mut parse_state,
+        &mut highlight_state,
+        &highlighter,
+        &mut lines,
+    )?;
+
+    HIGHLIGHT_PREFIX_CACHE.with_borrow_mut(|cache| {
+        *cache = Some(HighlightPrefixCache {
+            lang: lang.to_string(),
+            theme_revision,
+            prefix: code[..complete_len].to_string(),
+            parse_state: prefix_parse_state,
+            highlight_state: prefix_highlight_state,
+            lines: prefix_lines,
+        });
+    });
+
+    Some(lines)
 }
 
 // -- Public API ---------------------------------------------------------------
@@ -1113,6 +1262,50 @@ mod tests {
         let lines = highlight_code_to_lines(code, "python");
         assert_eq!(reconstructed(&lines), code);
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn incremental_prefix_highlighting_matches_from_scratch() {
+        let theme = current_syntax_theme();
+        let full = concat!(
+            "fn main() {\n",
+            "    let mut total = 0;\n",
+            "    for i in 0..3 {\n",
+            "        total += i;\n",
+            "    }\n",
+            "    println!(\"{total}\");\n",
+            "}\n",
+        );
+        let prefixes: Vec<&str> = full
+            .char_indices()
+            .filter(|&(_, ch)| ch == '\n')
+            .map(|(idx, _)| &full[..=idx])
+            .collect();
+
+        // Streaming commits successive '\n'-terminated prefixes; interleave a
+        // partial trailing line, a language switch, and a non-prefix input so
+        // the resume path and every invalidation path are all exercised.
+        let partial = &full[..prefixes[4].len() - 1];
+        let mut calls: Vec<(&str, &str)> = Vec::new();
+        calls.extend(prefixes[..4].iter().map(|prefix| (*prefix, "rust")));
+        calls.push((partial, "rust"));
+        calls.push((prefixes[4], "rust"));
+        calls.push(("print('hi')\n", "python"));
+        calls.push(("let z = 3;\n", "rust"));
+        calls.extend(prefixes[4..].iter().map(|prefix| (*prefix, "rust")));
+
+        for (code, lang) in calls {
+            let incremental = highlight_to_line_spans(code, lang);
+            let from_scratch = highlight_to_line_spans_with_theme(code, lang, &theme);
+            assert!(
+                from_scratch.is_some(),
+                "expected spans for {lang} input {code:?}"
+            );
+            assert_eq!(
+                incremental, from_scratch,
+                "incremental render diverged from from-scratch render for {lang} input {code:?}"
+            );
+        }
     }
 
     #[test]
