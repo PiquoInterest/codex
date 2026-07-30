@@ -28,7 +28,6 @@ use crate::injection::ToolMentionKind;
 use crate::injection::app_id_from_path;
 use crate::injection::tool_kind_for_path;
 use crate::mcp_skill_dependencies::maybe_prompt_and_install_mcp_dependencies;
-use crate::mcp_tool_exposure::build_mcp_tool_runtimes;
 use crate::mentions::build_connector_slug_counts;
 use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
@@ -58,11 +57,9 @@ use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
-use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
-use crate::tools::router::extension_tool_executors;
-use crate::tools::spec_plan::search_tool_enabled;
+use crate::tools::spec_plan::build_tool_router;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::record_turn_ttft_metric;
@@ -1548,27 +1545,14 @@ pub(crate) async fn built_tools(
             .instrument(trace_span!("built_tools.load_discoverable_tools"))
             .await
         };
-    let mcp_tool_runtimes = build_mcp_tool_runtimes(
-        &all_mcp_tools,
-        connectors.as_deref(),
-        &turn_context.config,
-        search_tool_enabled(turn_context),
-    );
-    let tool_router = Arc::new(ToolRouter::from_context(
+    let tool_router = Arc::new(build_tool_router(
+        sess,
         turn_context,
         environments,
         mcp,
-        ToolRouterParams {
-            tool_runtimes: mcp_tool_runtimes,
-            tool_suggest_candidates,
-            extension_tool_executors: extension_tool_executors(sess, step_store),
-            wait_for_environment_tool_config: sess
-                .services
-                .thread_extension_data
-                .get::<crate::WaitForEnvironmentToolConfig>(),
-            dynamic_tools: turn_context.dynamic_tools.as_slice(),
-        },
-        &sess.services.tool_search_handler_cache,
+        connectors.as_deref(),
+        step_store,
+        tool_suggest_candidates.as_ref(),
     ));
     (all_mcp_tools, tool_router)
 }

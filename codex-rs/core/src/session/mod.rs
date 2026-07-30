@@ -3098,10 +3098,37 @@ impl Session {
             .executor_capability_discovery_for_step(
                 &turn_context.config,
                 &ready_selected_capability_roots,
+                &environments,
+                turn_context.windows_sandbox_level,
             )
             .await;
         let extension_data = codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
         extension_data.insert(selected_capability_roots.clone());
+        if let Some(discovery) = &executor_capability_discovery {
+            extension_data.insert(discovery.as_ref().clone());
+            if !discovery.sandbox_contexts().is_empty() {
+                extension_data.insert(discovery.sandbox_contexts().clone());
+            }
+        } else if !turn_context
+            .config
+            .permissions
+            .file_system_sandbox_policy()
+            .has_full_disk_read_access()
+        {
+            let sandbox_contexts = environments
+                .turn_environments()
+                .map(|environment| {
+                    (
+                        environment.environment_id.clone(),
+                        turn_context.file_system_sandbox_context(
+                            /*additional_permissions*/ None,
+                            environment,
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            extension_data.insert(sandbox_contexts);
+        }
         let (mcp, prepared_recommendations) = async {
             tokio::join!(
                 self.mcp_runtime_for_step(
