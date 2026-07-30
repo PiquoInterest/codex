@@ -74,6 +74,7 @@ use codex_login::default_client::create_client_for_route;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::auth::AuthMode;
+use std::borrow::Cow;
 
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -182,7 +183,7 @@ fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffor
 
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
-    request: &ResponsesApiRequest,
+    request: &ResponsesApiRequest<'_>,
 ) -> SessionTelemetry {
     session_telemetry.clone().with_inference_request(
         request.service_tier.as_deref(),
@@ -295,7 +296,7 @@ struct LastResponse {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
-    last_request: Option<ResponsesApiRequest>,
+    last_request: Option<ResponsesApiRequest<'static>>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
@@ -305,8 +306,8 @@ struct WebsocketSession {
 // `client_metadata`, while websocket reuse compares the input separately and ignores metadata.
 // Keep the destructuring exhaustive so new request fields require an explicit reuse decision.
 fn responses_request_properties_match(
-    previous: &ResponsesApiRequest,
-    current: &ResponsesApiRequest,
+    previous: &ResponsesApiRequest<'_>,
+    current: &ResponsesApiRequest<'_>,
 ) -> bool {
     let ResponsesApiRequest {
         model: previous_model,
@@ -587,7 +588,7 @@ impl ModelClient {
         let ResponsesApiRequest {
             model,
             instructions,
-            mut input,
+            input,
             tools,
             parallel_tool_calls,
             reasoning,
@@ -596,10 +597,9 @@ impl ModelClient {
             text,
             ..
         } = request;
-        self.prepare_response_items_for_request(&mut input);
         let payload = ApiCompactionInput {
             model: &model,
-            input: &input,
+            input: input.as_ref(),
             instructions: &instructions,
             tools,
             parallel_tool_calls,
@@ -835,30 +835,48 @@ impl ModelClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_responses_request(
+    fn build_responses_request<'a>(
         &self,
         provider: &codex_api::Provider,
-        prompt: &Prompt,
+        prompt: &'a Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
-    ) -> Result<ResponsesApiRequest> {
-        let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+    ) -> Result<ResponsesApiRequest<'a>> {
         let is_openai = self.state.provider.info().is_openai();
-        if !is_openai {
-            for item in &mut input {
-                item.clear_internal_chat_message_metadata_passthrough();
-                if let ResponseItem::FunctionCall {
-                    encrypted_function_args,
-                    ..
-                } = item
-                {
-                    *encrypted_function_args = None;
+        // Every transform below is a per-item rewrite; when none applies the
+        // request can borrow the prompt's history instead of deep-cloning it.
+        let needs_owned_input = model_info.use_responses_lite
+            || !is_openai
+            || prompt
+                .input
+                .iter()
+                .any(|item| item.id().is_some_and(|id| !id.is_prefixed()));
+        let mut input: Cow<'a, [ResponseItem]> = if needs_owned_input {
+            let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+            if !is_openai {
+                for item in &mut input {
+                    item.clear_internal_chat_message_metadata_passthrough();
+                    if let ResponseItem::FunctionCall {
+                        encrypted_function_args,
+                        ..
+                    } = item
+                    {
+                        *encrypted_function_args = None;
+                    }
                 }
             }
-        }
+            for item in &mut input {
+                if item.id().is_some_and(|id| !id.is_prefixed()) {
+                    item.set_id(/*new_id*/ None);
+                }
+            }
+            Cow::Owned(input)
+        } else {
+            Cow::Borrowed(prompt.input.as_slice())
+        };
         let (instructions, tools) = if model_info.use_responses_lite {
             let tools = create_tools_json_for_responses_api(&prompt.tools)?;
             let mut prefix = vec![ResponseItem::AdditionalTools {
@@ -877,7 +895,7 @@ impl ModelClient {
                     internal_chat_message_metadata_passthrough: None,
                 });
             }
-            input.splice(0..0, prefix);
+            input.to_mut().splice(0..0, prefix);
             (String::new(), None)
         } else {
             (
@@ -1441,7 +1459,7 @@ impl ModelClientSession {
                 )
                 .await;
 
-            let mut request = self.client.build_responses_request(
+            let request = self.client.build_responses_request(
                 &client_setup.api_provider,
                 prompt,
                 model_info,
@@ -1450,8 +1468,6 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
-            self.client
-                .prepare_response_items_for_request(&mut request.input);
             let request_session_telemetry =
                 session_telemetry_for_request(session_telemetry, &request);
             let inference_trace_attempt = inference_trace.start_attempt();
@@ -1553,15 +1569,20 @@ impl ModelClientSession {
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             );
-            let mut request = self.client.build_responses_request(
-                &client_setup.api_provider,
-                prompt,
-                model_info,
-                effort.clone(),
-                summary,
-                service_tier.clone(),
-                responses_metadata,
-            )?;
+            // The websocket path mutates input for the wire and retains the
+            // request for reuse diffing, so it always owns its items.
+            let mut request = self
+                .client
+                .build_responses_request(
+                    &client_setup.api_provider,
+                    prompt,
+                    model_info,
+                    effort.clone(),
+                    summary,
+                    service_tier.clone(),
+                    responses_metadata,
+                )?
+                .into_owned_input();
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
                 session_telemetry.clone()
@@ -1641,12 +1662,14 @@ impl ModelClientSession {
                     .map(|item| item.id().cloned())
                     .collect::<Vec<_>>();
                 self.client
-                    .prepare_response_items_for_request(&mut request.input);
+                    .prepare_response_items_for_request(request.input.to_mut());
                 Some(original_item_ids)
             };
             let ws_payload = ResponseCreateWsRequest {
                 previous_response_id,
-                input: incremental_items.as_deref().unwrap_or(&request.input),
+                input: incremental_items
+                    .as_deref()
+                    .unwrap_or(request.input.as_ref()),
                 generate: if warmup { Some(false) } else { None },
                 client_metadata: response_create_client_metadata(
                     Some(client_metadata),
@@ -1674,7 +1697,9 @@ impl ModelClientSession {
                 )
                 .await;
             if let Some(original_item_ids) = original_item_ids {
-                for (item, original_item_id) in request.input.iter_mut().zip(original_item_ids) {
+                for (item, original_item_id) in
+                    request.input.to_mut().iter_mut().zip(original_item_ids)
+                {
                     item.set_id(original_item_id);
                 }
             }

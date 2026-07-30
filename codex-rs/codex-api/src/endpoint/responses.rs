@@ -69,7 +69,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
     )]
     pub async fn stream_request(
         &self,
-        request: ResponsesApiRequest,
+        request: ResponsesApiRequest<'_>,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {

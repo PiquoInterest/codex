@@ -931,7 +931,8 @@ mod tests {
                 }],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
-            }],
+            }]
+            .into(),
             tools: Some(
                 Arc::<RawValue>::from(
                     to_raw_value(&vec![json!({
