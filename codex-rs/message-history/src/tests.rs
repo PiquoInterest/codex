@@ -308,7 +308,7 @@ fn streaming_trim_matches_reference_implementation() {
         b"\n\n\n\n".to_vec(),
         b"one giant line without newline".to_vec(),
         b"one giant line with newline\n".to_vec(),
-        "caf\u{e9}\n\u{1f600}\u{1f600}\u{1f600}\n\u{4e16}\u{754c}\n"
+        "cafe\u{301}\n\u{1f600}\u{1f600}\u{1f600}\n\u{4e16}\u{754c}\n"
             .as_bytes()
             .to_vec(),
         b"tiny\nhuge-newest-entry-larger-than-the-cap-itself-so-it-must-be-retained\n".to_vec(),
