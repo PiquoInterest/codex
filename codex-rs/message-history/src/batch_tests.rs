@@ -231,19 +231,32 @@ async fn search_batch_preserves_identity_append_trim_and_short_file_semantics() 
     append_entry(&newest, "session", &trimmed_config)
         .await
         .expect("append and trim");
-    let trimmed = lookup_batch(
+    // The oversized append rotates the whole file into a segment. The cached
+    // identity still names that (renamed) file, every prior row survives with
+    // its offset, and a beyond-end cursor clamps to the available suffix.
+    let rotated = lookup_batch(
         log_id,
         HistoryBatchCursor::new(/*end_offset*/ 20),
         &trimmed_config,
     )
-    .expect("read trimmed history batch");
-    assert_eq!(trimmed.entries.len(), 1);
-    assert_eq!(trimmed.entries[0].offset, 0);
+    .expect("read rotated history batch");
     assert_eq!(
-        trimmed.entries[0].entry.as_ref().map(|entry| &entry.text),
-        Some(&newest)
+        rotated
+            .entries
+            .iter()
+            .map(|row| (
+                row.offset,
+                row.entry.as_ref().expect("row parses").text.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (3, newest.clone()),
+            (2, "appended".to_string()),
+            (1, "one".to_string()),
+            (0, "zero".to_string()),
+        ]
     );
-    assert_eq!(trimmed.next_older_cursor, None);
+    assert_eq!(rotated.next_older_cursor, None);
 }
 
 #[tokio::test]
@@ -356,4 +369,64 @@ async fn search_batch_defers_oversized_row_during_backward_scan() {
             .end_offset(),
         0
     );
+}
+
+#[tokio::test]
+async fn lookup_batch_pages_across_rotated_segments() {
+    let home = TempDir::new().expect("create temp dir");
+    let mut history = History::default();
+    let probe_config = crate::HistoryConfig::new(home.path(), &history);
+    crate::append_entry("probe", "conversation-id", &probe_config)
+        .await
+        .expect("write probe entry");
+    let history_path = home.path().join(crate::HISTORY_FILENAME);
+    let entry_len = std::fs::metadata(&history_path).expect("metadata").len();
+    std::fs::remove_file(&history_path).expect("reset history");
+
+    // Loose cap so nothing is deleted while the log spans several files.
+    history.max_bytes = Some(usize::try_from(entry_len * 20).expect("cap fits usize"));
+    let config = crate::HistoryConfig::new(home.path(), &history);
+
+    let total = 12usize;
+    for index in 0..total {
+        crate::append_entry(&format!("row-{index:02}"), "conversation-id", &config)
+            .await
+            .expect("append entry");
+    }
+    let set = crate::segments::SegmentSet::scan(home.path());
+    assert!(
+        !set.segments.is_empty(),
+        "the corpus must span rotated segments for this test to bite"
+    );
+
+    let (log_id, count) = crate::history_metadata(&config).await;
+    assert_eq!(count, total);
+
+    // Walk the full logical history newest-first through continuation
+    // cursors; batches never span files, so several hops are required.
+    let mut collected = Vec::new();
+    let mut cursor = Some(HistoryBatchCursor::new(count - 1));
+    let mut hops = 0;
+    while let Some(current) = cursor {
+        let batch = lookup_batch(log_id, current, &config).expect("batch resolves");
+        assert!(
+            !batch.entries.is_empty(),
+            "every hop must make progress (hop {hops})"
+        );
+        for row in &batch.entries {
+            collected.push((
+                row.offset,
+                row.entry.as_ref().expect("row parses").text.clone(),
+            ));
+        }
+        cursor = batch.next_older_cursor;
+        hops += 1;
+        assert!(hops <= total + 2, "cursor chain must terminate");
+    }
+
+    let expected: Vec<(usize, String)> = (0..total)
+        .rev()
+        .map(|index| (index, format!("row-{index:02}")))
+        .collect();
+    assert_eq!(collected, expected);
 }

@@ -107,276 +107,208 @@ async fn lookup_uses_stable_log_id_after_appends() {
 }
 
 #[tokio::test]
-async fn append_entry_trims_history_when_beyond_max_bytes() {
+async fn append_entry_caps_history_with_segment_rotation() {
     let codex_home = TempDir::new().expect("create temp dir");
     let mut history = History::default();
-    let mut config = HistoryConfig::new(codex_home.path(), &history);
-    let conversation_id = "conversation-id";
-
-    let entry_one = "a".repeat(200);
-    let entry_two = "b".repeat(200);
-
-    let history_path = codex_home.path().join("history.jsonl");
-
-    append_entry(&entry_one, &conversation_id, &config)
+    let entry = "a".repeat(200);
+    let config_probe = HistoryConfig::new(codex_home.path(), &history);
+    append_entry(&entry, "conversation-id", &config_probe)
         .await
-        .expect("write first entry");
+        .expect("write probe entry");
+    let history_path = codex_home.path().join(HISTORY_FILENAME);
+    let entry_len = std::fs::metadata(&history_path).expect("metadata").len();
 
-    let first_len = std::fs::metadata(&history_path).expect("metadata").len();
-    let limit_bytes = first_len + 10;
+    // Cap at roughly six entries; rotation triggers near a quarter of that.
+    let max_bytes = usize::try_from(entry_len * 6).expect("cap fits usize");
+    history.max_bytes = Some(max_bytes);
+    let config = HistoryConfig::new(codex_home.path(), &history);
 
-    history.max_bytes = Some(usize::try_from(limit_bytes).expect("limit should fit into usize"));
-    config = HistoryConfig::new(codex_home.path(), &history);
+    for _ in 0..40 {
+        append_entry(&entry, "conversation-id", &config)
+            .await
+            .expect("append entry");
+    }
 
-    append_entry(&entry_two, &conversation_id, &config)
-        .await
-        .expect("write second entry");
-
-    let contents = std::fs::read_to_string(&history_path).expect("read history");
-
-    let entries = contents
-        .lines()
-        .map(|line| serde_json::from_str::<HistoryEntry>(line).expect("parse entry"))
-        .collect::<Vec<HistoryEntry>>();
-
-    assert_eq!(
-        entries.len(),
-        1,
-        "only one entry left because entry_one should be evicted"
+    let active_len = std::fs::metadata(&history_path).expect("metadata").len();
+    assert!(
+        active_len < entry_len * 3,
+        "active file must stay below the rotation threshold plus one entry"
     );
-    assert_eq!(entries[0].text, entry_two);
-    assert!(std::fs::metadata(&history_path).expect("metadata").len() <= limit_bytes);
+
+    let set = SegmentSet::scan(codex_home.path());
+    assert!(
+        !set.segments.is_empty(),
+        "rotation must have produced segments"
+    );
+
+    // Retained bytes stay bounded: segments within the cap (the newest may
+    // overshoot by itself) plus a below-threshold active file.
+    let total = set.total_bytes() + active_len;
+    assert!(
+        total <= (max_bytes as u64) + entry_len * 3,
+        "retained bytes {total} exceed cap {max_bytes} plus rotation slack"
+    );
+
+    // The newest entry is always retrievable at the last global offset.
+    let (log_id, count) = history_metadata(&config).await;
+    assert!(count > 0);
+    let newest = lookup(log_id, count - 1, &config).expect("newest entry resolves");
+    assert_eq!(newest.text, entry);
 }
 
 #[tokio::test]
-async fn append_entry_trims_history_to_soft_cap() {
+async fn append_entry_retains_newest_entry_under_tiny_cap() {
     let codex_home = TempDir::new().expect("create temp dir");
     let mut history = History::default();
-    let mut config = HistoryConfig::new(codex_home.path(), &history);
-    let conversation_id = "conversation-id";
+    // Cap far below one entry: every append rotates immediately and deletes
+    // every older segment, but the newest entry must always survive.
+    history.max_bytes = Some(8);
+    let config = HistoryConfig::new(codex_home.path(), &history);
 
-    let short_entry = "a".repeat(200);
-    let long_entry = "b".repeat(400);
+    for index in 0..5 {
+        let text = format!("entry-{index}");
+        append_entry(&text, "conversation-id", &config)
+            .await
+            .expect("append entry");
 
-    let history_path = codex_home.path().join("history.jsonl");
+        let (log_id, count) = history_metadata(&config).await;
+        assert!(count > 0);
+        let newest = lookup(log_id, count - 1, &config).expect("newest entry resolves");
+        assert_eq!(newest.text, text);
+    }
+}
 
-    append_entry(&short_entry, &conversation_id, &config)
+#[tokio::test]
+async fn lookup_resolves_global_offsets_across_segments() {
+    let codex_home = TempDir::new().expect("create temp dir");
+    let mut history = History::default();
+    let probe_config = HistoryConfig::new(codex_home.path(), &history);
+    append_entry("probe", "conversation-id", &probe_config)
+        .await
+        .expect("write probe entry");
+    let history_path = codex_home.path().join(HISTORY_FILENAME);
+    let entry_len = std::fs::metadata(&history_path).expect("metadata").len();
+    std::fs::remove_file(&history_path).expect("reset history");
+
+    // Threshold of ~2.5 entries with a cap loose enough that nothing is
+    // deleted: every entry ever appended must stay reachable via its global
+    // offset even though the log spans multiple files.
+    history.max_bytes = Some(usize::try_from(entry_len * 10).expect("cap fits usize"));
+    let config = HistoryConfig::new(codex_home.path(), &history);
+
+    let texts: Vec<String> = (0..8).map(|index| format!("entry-{index}")).collect();
+    for text in &texts {
+        // Pad to the probe length so rotation cadence is predictable.
+        let padded = format!("{text:<width$}", width = "probe".len());
+        append_entry(&padded, "conversation-id", &config)
+            .await
+            .expect("append entry");
+    }
+
+    let set = SegmentSet::scan(codex_home.path());
+    assert!(
+        !set.segments.is_empty(),
+        "the corpus must span rotated segments for this test to bite"
+    );
+
+    let (log_id, count) = history_metadata(&config).await;
+    assert_eq!(count, texts.len());
+    for (offset, text) in texts.iter().enumerate() {
+        let via_id = lookup(log_id, offset, &config).expect("entry resolves via active id");
+        assert_eq!(via_id.text.trim_end(), text.as_str());
+        let via_wildcard = lookup(0, offset, &config).expect("entry resolves via wildcard id");
+        assert_eq!(via_wildcard.text.trim_end(), text.as_str());
+    }
+}
+
+#[tokio::test]
+async fn lookup_resolves_pre_rotation_identity_locally() {
+    let codex_home = TempDir::new().expect("create temp dir");
+    let mut history = History::default();
+    let probe_config = HistoryConfig::new(codex_home.path(), &history);
+    append_entry("first", "conversation-id", &probe_config)
         .await
         .expect("write first entry");
+    let history_path = codex_home.path().join(HISTORY_FILENAME);
+    let entry_len = std::fs::metadata(&history_path).expect("metadata").len();
 
-    let short_entry_len = std::fs::metadata(&history_path).expect("metadata").len();
+    history.max_bytes = Some(usize::try_from(entry_len * 10).expect("cap fits usize"));
+    let config = HistoryConfig::new(codex_home.path(), &history);
 
-    append_entry(&long_entry, &conversation_id, &config)
+    append_entry("second", "conversation-id", &config)
         .await
         .expect("write second entry");
+    let (pre_rotation_id, pre_count) = history_metadata(&config).await;
+    assert_eq!(pre_count, 2);
 
-    let two_entry_len = std::fs::metadata(&history_path).expect("metadata").len();
+    // Force at least one rotation so the pre-rotation file becomes a segment.
+    for index in 0..6 {
+        append_entry(&format!("later-{index}"), "conversation-id", &config)
+            .await
+            .expect("append entry");
+    }
+    let set = SegmentSet::scan(codex_home.path());
+    assert!(!set.segments.is_empty(), "rotation must have happened");
 
-    let long_entry_len = two_entry_len
-        .checked_sub(short_entry_len)
-        .expect("second entry length should be larger than first entry length");
+    // Rotation renames the file in place, so the cached identity still names
+    // it and the cached local offset still points at the same line.
+    let entry = lookup(pre_rotation_id, 1, &config)
+        .expect("pre-rotation identity resolves against the rotated segment");
+    assert_eq!(entry.text, "second");
+}
 
-    history.max_bytes = Some(
-        usize::try_from((2 * long_entry_len) + (short_entry_len / 2))
-            .expect("max bytes should fit into usize"),
-    );
-    config = HistoryConfig::new(codex_home.path(), &history);
-
-    append_entry(&long_entry, &conversation_id, &config)
+#[tokio::test]
+async fn active_file_keeps_newest_entries_for_legacy_readers() {
+    let codex_home = TempDir::new().expect("create temp dir");
+    let mut history = History::default();
+    let probe_config = HistoryConfig::new(codex_home.path(), &history);
+    append_entry("probe", "conversation-id", &probe_config)
         .await
-        .expect("write third entry");
+        .expect("write probe entry");
+    let history_path = codex_home.path().join(HISTORY_FILENAME);
+    let entry_len = std::fs::metadata(&history_path).expect("metadata").len();
+    std::fs::remove_file(&history_path).expect("reset history");
 
-    let contents = std::fs::read_to_string(&history_path).expect("read history");
+    history.max_bytes = Some(usize::try_from(entry_len * 10).expect("cap fits usize"));
+    let config = HistoryConfig::new(codex_home.path(), &history);
+    for index in 0..8 {
+        append_entry(&format!("entry-{index}"), "conversation-id", &config)
+            .await
+            .expect("append entry");
+    }
 
-    let entries = contents
-        .lines()
-        .map(|line| serde_json::from_str::<HistoryEntry>(line).expect("parse entry"))
-        .collect::<Vec<HistoryEntry>>();
-
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].text, long_entry);
-
-    let pruned_len = std::fs::metadata(&history_path).expect("metadata").len();
-    let max_bytes = config.max_bytes.expect("max bytes should be configured") as u64;
-
-    assert!(pruned_len <= max_bytes);
-
-    let soft_cap_bytes = ((max_bytes as f64) * HISTORY_SOFT_CAP_RATIO)
-        .floor()
-        .clamp(1.0, max_bytes as f64) as u64;
-    let len_without_first = 2 * long_entry_len;
-
-    assert!(
-        len_without_first <= max_bytes,
-        "dropping only the first entry would satisfy the hard cap"
-    );
-    assert!(
-        len_without_first > soft_cap_bytes,
-        "soft cap should require more aggressive trimming than the hard cap"
-    );
-
-    assert_eq!(pruned_len, long_entry_len);
-    assert!(pruned_len <= soft_cap_bytes.max(long_entry_len));
+    // A pre-segmentation binary reads only `history.jsonl`; it must see a
+    // clean JSONL suffix of the logical history (possibly empty right after a
+    // rotation), never a corrupt or unrelated file.
+    let contents = std::fs::read_to_string(&history_path).expect("read active file");
+    let mut seen = Vec::new();
+    for line in contents.lines() {
+        let entry: HistoryEntry = serde_json::from_str(line).expect("active line parses");
+        seen.push(entry.text);
+    }
+    let (_, total) = history_metadata(&config).await;
+    assert_eq!(total, 8);
+    let expected_suffix: Vec<String> = (8 - seen.len()..8)
+        .map(|index| format!("entry-{index}"))
+        .collect();
+    assert_eq!(seen, expected_suffix);
 }
 
-/// Reference implementation of the trim algorithm this crate used before the
-/// streaming scan: read every line's length forward, then drop oldest lines
-/// until the remainder fits the target.
-fn reference_enforce_history_limit(file: &mut File, max_bytes: u64) -> std::io::Result<()> {
-    use std::io::BufRead;
-    use std::io::Read;
-    use std::io::Seek;
-    use std::io::SeekFrom;
+#[tokio::test]
+async fn foreign_history_files_are_ignored() {
+    let codex_home = TempDir::new().expect("create temp dir");
+    std::fs::write(codex_home.path().join("history.abc.jsonl"), b"junk\n").expect("write junk");
+    std::fs::write(codex_home.path().join("history..jsonl"), b"junk\n").expect("write junk");
+    std::fs::write(codex_home.path().join("history.10x.jsonl"), b"junk\n").expect("write junk");
 
-    let mut current_len = file.metadata()?.len();
-    if current_len <= max_bytes {
-        return Ok(());
-    }
-    let mut reader_file = file.try_clone()?;
-    reader_file.seek(SeekFrom::Start(0))?;
-    let mut buf_reader = std::io::BufReader::new(reader_file);
-    let mut line_lengths = Vec::new();
-    let mut line_buf = String::new();
-    loop {
-        line_buf.clear();
-        let bytes = buf_reader.read_line(&mut line_buf)?;
-        if bytes == 0 {
-            break;
-        }
-        line_lengths.push(bytes as u64);
-    }
-    if line_lengths.is_empty() {
-        return Ok(());
-    }
-    let last_index = line_lengths.len() - 1;
-    let trim_target = trim_target_bytes(max_bytes, line_lengths[last_index]);
-    let mut drop_bytes = 0u64;
-    let mut idx = 0usize;
-    while current_len > trim_target && idx < last_index {
-        current_len = current_len.saturating_sub(line_lengths[idx]);
-        drop_bytes += line_lengths[idx];
-        idx += 1;
-    }
-    if drop_bytes == 0 {
-        return Ok(());
-    }
-    let mut reader = buf_reader.into_inner();
-    reader.seek(SeekFrom::Start(drop_bytes))?;
-    let mut tail = Vec::new();
-    reader.read_to_end(&mut tail)?;
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&tail)?;
-    file.flush()?;
-    Ok(())
-}
+    let history = History::default();
+    let config = HistoryConfig::new(codex_home.path(), &history);
+    append_entry("only", "conversation-id", &config)
+        .await
+        .expect("append entry");
 
-fn run_trim(
-    dir: &TempDir,
-    name: &str,
-    contents: &[u8],
-    max_bytes: usize,
-    streaming: bool,
-) -> Vec<u8> {
-    let path = dir.path().join(name);
-    std::fs::write(&path, contents).expect("write corpus");
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .expect("open corpus");
-    if streaming {
-        enforce_history_limit(&mut file, Some(max_bytes)).expect("streaming trim");
-    } else {
-        reference_enforce_history_limit(&mut file, max_bytes as u64).expect("reference trim");
-    }
-    std::fs::read(&path).expect("read trimmed")
-}
-
-/// The streaming trim must produce byte-identical files to the previous
-/// line-lengths algorithm across edge shapes: multibyte UTF-8, unterminated
-/// final entries, oversized newest entries, tiny caps, and boundary caps.
-#[test]
-fn streaming_trim_matches_reference_implementation() {
-    let dir = TempDir::new().expect("create temp dir");
-
-    let mut corpora: Vec<Vec<u8>> = vec![
-        b"a\n".to_vec(),
-        b"a\nb\n".to_vec(),
-        b"a\nb".to_vec(),
-        b"\n".to_vec(),
-        b"\n\n\n\n".to_vec(),
-        b"one giant line without newline".to_vec(),
-        b"one giant line with newline\n".to_vec(),
-        "cafe\u{301}\n\u{1f600}\u{1f600}\u{1f600}\n\u{4e16}\u{754c}\n"
-            .as_bytes()
-            .to_vec(),
-        b"tiny\nhuge-newest-entry-larger-than-the-cap-itself-so-it-must-be-retained\n".to_vec(),
-    ];
-
-    // Deterministic LCG so failures reproduce; varied line lengths including
-    // empty lines and a possibly unterminated tail.
-    let mut state = 0x1234_5678_9abc_def0u64;
-    let mut next = move || {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (state >> 33) as usize
-    };
-    for _ in 0..40 {
-        let lines = next() % 30 + 1;
-        let mut corpus = Vec::new();
-        for line_idx in 0..lines {
-            let len = next() % 60;
-            let unit = ["x", "\u{e9}", "\u{1f600}"][next() % 3];
-            let mut line = unit.repeat(len);
-            line.push('\n');
-            if line_idx + 1 == lines && next() % 3 == 0 {
-                line.pop();
-                if line.is_empty() {
-                    line.push('x');
-                }
-            }
-            corpus.extend_from_slice(line.as_bytes());
-        }
-        corpora.push(corpus);
-    }
-
-    let mut compared = 0usize;
-    for (corpus_idx, corpus) in corpora.iter().enumerate() {
-        for max_bytes in [1usize, 2, 3, 5, 8, 16, 40, 64, 200] {
-            let reference = run_trim(
-                &dir,
-                &format!("ref-{corpus_idx}-{max_bytes}"),
-                corpus,
-                max_bytes,
-                false,
-            );
-            let streaming = run_trim(
-                &dir,
-                &format!("new-{corpus_idx}-{max_bytes}"),
-                corpus,
-                max_bytes,
-                true,
-            );
-            assert_eq!(
-                reference, streaming,
-                "corpus {corpus_idx} with max_bytes {max_bytes} diverged",
-            );
-            compared += 1;
-        }
-    }
-    assert!(compared > 400, "expected a meaningful comparison matrix");
-}
-
-/// Byte-defined boundaries mean invalid UTF-8 in discarded entries no longer
-/// aborts the trim; the newest entry is still retained verbatim.
-#[test]
-fn streaming_trim_tolerates_invalid_utf8_in_dropped_prefix() {
-    let dir = TempDir::new().expect("create temp dir");
-    let mut corpus = vec![0xffu8, 0xfe, 0xfd];
-    corpus.push(b'\n');
-    corpus.extend_from_slice(b"newest\n");
-    let trimmed = run_trim(&dir, "invalid-utf8", &corpus, 8, true);
-    assert_eq!(trimmed, b"newest\n");
+    let (log_id, count) = history_metadata(&config).await;
+    assert_eq!(count, 1);
+    let entry = lookup(log_id, 0, &config).expect("entry resolves");
+    assert_eq!(entry.text, "only");
 }

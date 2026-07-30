@@ -46,6 +46,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 /// Filename that stores the message history inside `~/.codex`.
+mod segments;
+use segments::SegmentSet;
+
 const HISTORY_FILENAME: &str = "history.jsonl";
 const HISTORY_READ_BUFFER_SIZE: usize = 8192;
 /// Larger buffer for the whole-file newline count at thread open; the batch
@@ -54,7 +57,6 @@ const HISTORY_READ_BUFFER_SIZE: usize = 8192;
 const HISTORY_COUNT_BUFFER_SIZE: usize = 256 * 1024;
 
 /// When history exceeds the hard cap, trim it down to this fraction of `max_bytes`.
-const HISTORY_SOFT_CAP_RATIO: f64 = 0.8;
 
 const MAX_RETRIES: usize = 10;
 const RETRY_SLEEP: Duration = Duration::from_millis(100);
@@ -150,26 +152,43 @@ pub async fn append_entry(
         options.mode(0o600);
     }
 
-    let mut history_file = options.open(&path)?;
+    let history_file = options.open(&path)?;
 
     // Ensure permissions.
     ensure_owner_only_permissions(&history_file).await?;
+    drop(history_file);
 
     let history_max_bytes = config.max_bytes;
 
     // Perform a blocking write under an advisory write lock using std::fs.
     tokio::task::spawn_blocking(move || -> Result<()> {
-        // Retry a few times to avoid indefinite blocking when contended.
+        // Retry a few times to avoid indefinite blocking when contended. The
+        // file is reopened on every attempt: a concurrent writer may rotate
+        // the path between our open and lock, in which case the locked handle
+        // would reference a frozen segment rather than the active file.
         for _ in 0..MAX_RETRIES {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.append(true);
+                options.mode(0o600);
+            }
+            let mut history_file = options.open(&path)?;
             match history_file.try_lock() {
                 Ok(()) => {
+                    if !locked_handle_matches_path(&history_file, &path) {
+                        // Lost a rotation race; retry against the fresh active file.
+                        continue;
+                    }
                     // While holding the exclusive lock, write the full line.
                     // We do not open the file with `append(true)` on Windows, so ensure the
                     // cursor is positioned at the end before writing.
                     history_file.seek(SeekFrom::End(0))?;
                     history_file.write_all(line.as_bytes())?;
                     history_file.flush()?;
-                    enforce_history_limit(&mut history_file, history_max_bytes)?;
+                    maybe_rotate_and_enforce(&history_file, &path, history_max_bytes)?;
                     return Ok(());
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -189,124 +208,45 @@ pub async fn append_entry(
     Ok(())
 }
 
-/// Trim the history file to honor `max_bytes`, dropping the oldest lines while holding
-/// the write lock so the newest entry is always retained. When the file exceeds the
-/// hard cap, it rewrites the remaining tail to a soft cap to avoid trimming again
-/// immediately on the next write.
-fn enforce_history_limit(file: &mut File, max_bytes: Option<usize>) -> Result<()> {
+/// Returns whether a locked handle still refers to the file at `path`.
+///
+/// A concurrent rotation renames the active file after another writer opened
+/// it but before that writer acquired the lock; comparing identities detects
+/// the swap. Platforms with no file identity treat every handle as current.
+fn locked_handle_matches_path(file: &File, path: &Path) -> bool {
+    let (Ok(handle_meta), Ok(path_meta)) = (file.metadata(), std::fs::metadata(path)) else {
+        return false;
+    };
+    match (log_identity(&handle_meta), log_identity(&path_meta)) {
+        (Some(handle_id), Some(path_id)) => handle_id == path_id,
+        _ => true,
+    }
+}
+
+/// Rotates a full active file into an immutable segment and enforces the cap.
+///
+/// Runs under the exclusive append lock. When the active file reaches a
+/// quarter of `max_bytes` it is renamed to `history.<start>.jsonl` (keeping
+/// its identity for cached lookups); the next append recreates the active
+/// file. Cap enforcement then deletes whole segments oldest-first, never the
+/// newest segment, so the most recent entry always survives.
+fn maybe_rotate_and_enforce(file: &File, path: &Path, max_bytes: Option<usize>) -> Result<()> {
     let Some(max_bytes) = max_bytes else {
         return Ok(());
     };
-
-    if max_bytes == 0 {
+    let rotate_threshold = (max_bytes as u64 / 4).max(1);
+    if file.metadata()?.len() < rotate_threshold {
         return Ok(());
     }
-
-    let max_bytes = match u64::try_from(max_bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(()),
+    let Some(dir) = path.parent() else {
+        return Ok(());
     };
-
-    let current_len = file.metadata()?.len();
-
-    if current_len <= max_bytes {
-        return Ok(());
-    }
-
-    let mut reader = file.try_clone()?;
-
-    // Locate the newest entry with a bounded backward scan instead of reading
-    // the whole file forward line by line; only the newest entry's length
-    // matters for the trim target.
-    let newest_start = last_line_start(&mut reader, current_len)?;
-    let trim_target = trim_target_bytes(max_bytes, current_len - newest_start);
-    let excess = current_len.saturating_sub(trim_target);
-    if excess == 0 || newest_start == 0 {
-        return Ok(());
-    }
-
-    // Scan newline boundaries forward over only the oldest entries, stopping
-    // at the first boundary that discards at least `excess` bytes. The newest
-    // entry is never dropped; when every older entry is too small the whole
-    // older prefix goes. Boundaries are byte-defined, so unlike the previous
-    // whole-file `read_line` pass this does not validate (or fail on) invalid
-    // UTF-8 in entries that are about to be discarded.
-    let mut drop_bytes = newest_start;
-    reader.seek(SeekFrom::Start(0))?;
-    let mut buf = vec![0u8; HISTORY_READ_BUFFER_SIZE];
-    let mut pos = 0u64;
-    'scan: while pos < newest_start {
-        let want = usize::try_from((newest_start - pos).min(HISTORY_READ_BUFFER_SIZE as u64))
-            .unwrap_or(HISTORY_READ_BUFFER_SIZE);
-        let read = reader.read(&mut buf[..want])?;
-        if read == 0 {
-            break;
-        }
-        for offset in memchr_iter(b'\n', &buf[..read]) {
-            let line_end = pos + offset as u64 + 1;
-            if line_end >= excess {
-                drop_bytes = line_end;
-                break 'scan;
-            }
-        }
-        pos += read as u64;
-    }
-
-    if drop_bytes == 0 {
-        return Ok(());
-    }
-
-    reader.seek(SeekFrom::Start(drop_bytes))?;
-
-    let capacity = usize::try_from(current_len.saturating_sub(drop_bytes)).unwrap_or(0);
-    let mut tail = Vec::with_capacity(capacity);
-
-    reader.read_to_end(&mut tail)?;
-
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&tail)?;
-    file.flush()?;
-
+    let set = SegmentSet::scan(dir);
+    let start = set.active_start();
+    std::fs::rename(path, segments::segment_path(dir, start))?;
+    let set = SegmentSet::scan(dir);
+    segments::delete_oldest_over_budget(&set, max_bytes as u64);
     Ok(())
-}
-
-/// Returns the byte offset where the newest entry begins, scanning backward in
-/// bounded chunks. A single trailing newline terminates the newest entry
-/// rather than starting an empty one, matching `read_line` semantics.
-fn last_line_start(file: &mut File, len: u64) -> Result<u64> {
-    if len == 0 {
-        return Ok(0);
-    }
-    let mut buf = vec![0u8; HISTORY_READ_BUFFER_SIZE];
-    let mut end = len;
-    let mut first_chunk = true;
-    while end > 0 {
-        let start = end.saturating_sub(HISTORY_READ_BUFFER_SIZE as u64);
-        let chunk_len = usize::try_from(end - start).unwrap_or(HISTORY_READ_BUFFER_SIZE);
-        file.seek(SeekFrom::Start(start))?;
-        file.read_exact(&mut buf[..chunk_len])?;
-        let mut search_end = chunk_len;
-        if first_chunk {
-            if buf[chunk_len - 1] == b'\n' {
-                search_end -= 1;
-            }
-            first_chunk = false;
-        }
-        if let Some(idx) = memchr::memrchr(b'\n', &buf[..search_end]) {
-            return Ok(start + idx as u64 + 1);
-        }
-        end = start;
-    }
-    Ok(0)
-}
-
-fn trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64 {
-    let soft_cap_bytes = ((max_bytes as f64) * HISTORY_SOFT_CAP_RATIO)
-        .floor()
-        .clamp(1.0, max_bytes as f64) as u64;
-
-    soft_cap_bytes.max(newest_entry_len)
 }
 
 /// Asynchronously fetch the history file's *identifier* and current entry count.
@@ -318,7 +258,18 @@ fn trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64 {
 /// `(log_id, 0)` so callers can still detect that a history file exists.
 pub async fn history_metadata(config: &HistoryConfig) -> (u64, usize) {
     let path = history_filepath(config);
-    history_metadata_for_file(&path).await
+    let (log_id, active_count) = history_metadata_for_file(&path).await;
+    let dir = path.parent().map(Path::to_path_buf);
+    let start = tokio::task::spawn_blocking(move || {
+        dir.map(|dir| SegmentSet::scan(&dir).active_start())
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0);
+    let total = usize::try_from(start)
+        .unwrap_or(usize::MAX)
+        .saturating_add(active_count);
+    (log_id, total)
 }
 
 /// Look up a single history entry by file identity and zero-based offset.
@@ -392,60 +343,51 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
 }
 
 fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<HistoryEntry> {
-    use std::io::BufRead;
-    use std::io::BufReader;
+    let dir = path.parent()?;
+    let set = SegmentSet::scan(dir);
 
-    let file: File = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to open history file");
-            return None;
+    let active = OpenOptions::new().read(true).open(path).ok();
+    let active_id = active
+        .as_ref()
+        .and_then(|file| file.metadata().ok())
+        .and_then(|metadata| log_identity(&metadata));
+
+    if log_id == 0 || active_id == Some(log_id) || active_id.is_none() {
+        // Global resolution: `offset` counts from the oldest retained entry
+        // across rotated segments plus the active file.
+        let start = set.active_start();
+        let global = offset as u64;
+        if global >= start {
+            let local = usize::try_from(global - start).ok()?;
+            return read_active_entry_locked(active?, local);
         }
-    };
-
-    let metadata = match file.metadata() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to stat history file");
-            return None;
-        }
-    };
-
-    let current_log_id = log_identity(&metadata)?;
-
-    if log_id != 0 && current_log_id != log_id {
-        return None;
+        let (index, local) = set.locate(global)?;
+        let file = File::open(&set.segments[index].path).ok()?;
+        return parse_history_line(segments::read_line_at(file, local)?);
     }
 
-    // Open & lock file for reading using a shared lock.
-    // Retry a few times to avoid indefinite blocking.
+    // The caller's identifier predates a rotation: it names what is now an
+    // immutable segment, and `offset` is local to that file. Rotation renames
+    // the file in place, so identity and line numbering both still hold.
+    let segment = set.segments.iter().find(|segment| {
+        std::fs::metadata(&segment.path)
+            .ok()
+            .and_then(|metadata| log_identity(&metadata))
+            == Some(log_id)
+    })?;
+    let file = File::open(&segment.path).ok()?;
+    parse_history_line(segments::read_line_at(file, offset as u64)?)
+}
+
+/// Reads the `local`th line of the active history file under a shared lock.
+///
+/// The lock is retried a bounded number of times; rotated segments are read
+/// without locking because they are frozen after rotation.
+fn read_active_entry_locked(file: File, local: usize) -> Option<HistoryEntry> {
     for _ in 0..MAX_RETRIES {
-        let lock_result = file.try_lock_shared();
-
-        match lock_result {
+        match file.try_lock_shared() {
             Ok(()) => {
-                let reader = BufReader::new(&file);
-                for (idx, line_res) in reader.lines().enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to read line from history file");
-                            return None;
-                        }
-                    };
-
-                    if idx == offset {
-                        match serde_json::from_str::<HistoryEntry>(&line) {
-                            Ok(entry) => return Some(entry),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to parse history entry");
-                                return None;
-                            }
-                        }
-                    }
-                }
-                // Not found at requested offset.
-                return None;
+                return parse_history_line(segments::read_line_at(file, local as u64)?);
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 std::thread::sleep(RETRY_SLEEP);
@@ -456,8 +398,17 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
             }
         }
     }
-
     None
+}
+
+fn parse_history_line(line: String) -> Option<HistoryEntry> {
+    match serde_json::from_str::<HistoryEntry>(&line) {
+        Ok(entry) => Some(entry),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse history entry");
+            None
+        }
+    }
 }
 
 #[cfg(unix)]
