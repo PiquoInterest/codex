@@ -32,12 +32,10 @@ pub fn spawn_rollout_compression_worker(codex_home: PathBuf) {
 
 /// Returns the modified time for the existing plain or compressed rollout file.
 pub(crate) async fn file_modified_time(path: &Path) -> io::Result<Option<time::OffsetDateTime>> {
-    let Some(path) = path::existing_rollout_path(path).await else {
+    let Some((_, meta)) = path::existing_rollout_metadata(path).await else {
         return Ok(None);
     };
-    let meta = tokio::fs::metadata(path).await?;
-    let modified = meta.modified().ok();
-    Ok(modified.map(time::OffsetDateTime::from))
+    Ok(meta.modified().ok().map(time::OffsetDateTime::from))
 }
 
 /// Opens a rollout line reader that transparently handles plain `.jsonl` and `.jsonl.zst` files.
@@ -974,15 +972,26 @@ mod path {
     }
 
     pub(super) async fn existing_rollout_path(path: &Path) -> Option<PathBuf> {
+        existing_rollout_metadata(path).await.map(|(path, _)| path)
+    }
+
+    /// Resolves the existing plain-or-compressed rollout path together with the
+    /// metadata already fetched while probing, so callers that need file
+    /// metadata (e.g. mtime) do not have to stat the resolved path again.
+    pub(super) async fn existing_rollout_metadata(
+        path: &Path,
+    ) -> Option<(PathBuf, std::fs::Metadata)> {
         let plain_path = plain_rollout_path(path);
-        if matches!(tokio::fs::metadata(plain_path.as_path()).await, Ok(metadata) if metadata.is_file())
+        if let Ok(metadata) = tokio::fs::metadata(plain_path.as_path()).await
+            && metadata.is_file()
         {
-            return Some(plain_path);
+            return Some((plain_path, metadata));
         }
         let compressed_path = compressed_rollout_path(plain_path.as_path());
-        if matches!(tokio::fs::metadata(compressed_path.as_path()).await, Ok(metadata) if metadata.is_file())
+        if let Ok(metadata) = tokio::fs::metadata(compressed_path.as_path()).await
+            && metadata.is_file()
         {
-            return Some(compressed_path);
+            return Some((compressed_path, metadata));
         }
         None
     }

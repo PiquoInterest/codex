@@ -334,13 +334,10 @@ async fn write_and_project(
 
 async fn durable_write(recorder: &RolloutRecorder, write: RolloutWriteOp) -> ThreadStoreResult<()> {
     match write {
-        RolloutWriteOp::AppendItems(items) => {
-            recorder
-                .record_canonical_items(items.as_slice())
-                .await
-                .map_err(thread_store_io_error)?;
-            recorder.flush().await.map_err(thread_store_io_error)
-        }
+        RolloutWriteOp::AppendItems(items) => recorder
+            .record_canonical_items_flushed(items.as_slice())
+            .await
+            .map_err(thread_store_io_error),
         RolloutWriteOp::Persist => recorder.persist().await.map_err(thread_store_io_error),
         RolloutWriteOp::Flush => recorder.flush().await.map_err(thread_store_io_error),
     }

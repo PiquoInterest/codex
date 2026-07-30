@@ -1,5 +1,6 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -115,6 +116,12 @@ pub enum RolloutRecorderParams {
 
 enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
+    /// Append items and acknowledge once they are written, combining
+    /// `AddItems` + `Flush` into a single writer-task round trip.
+    AddItemsFlushed {
+        items: Vec<RolloutItem>,
+        ack: oneshot::Sender<std::io::Result<()>>,
+    },
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -547,6 +554,9 @@ impl RolloutRecorder {
         // Warm the DB by repairing every filesystem hit before querying SQLite. Source/provider/cwd
         // filters are already validated from rollout head metadata, so lightweight read-repair is
         // enough there. Search can depend on full title metadata, so keep full reconciliation.
+        // Keep the rows read-repair already fetched so the metadata overlay below does not issue
+        // a second point SELECT per item.
+        let mut repaired_metadata = HashMap::new();
         for item in &fs_page.items {
             if search_term.is_some() {
                 state_db::reconcile_rollout(
@@ -559,14 +569,16 @@ impl RolloutRecorder {
                     /*new_thread_memory_mode*/ None,
                 )
                 .await;
-            } else {
-                state_db::read_repair_rollout_path(
-                    state_db_ctx.as_deref(),
-                    item.thread_id,
-                    Some(archived),
-                    item.path.as_path(),
-                )
-                .await;
+            } else if let Some(metadata) = state_db::read_repair_rollout_path(
+                state_db_ctx.as_deref(),
+                item.thread_id,
+                Some(archived),
+                item.path.as_path(),
+            )
+            .await
+                && let Some(thread_id) = item.thread_id
+            {
+                repaired_metadata.insert(thread_id, metadata);
             }
         }
 
@@ -671,6 +683,7 @@ impl RolloutRecorder {
                 return Ok(fill_missing_thread_item_metadata_from_state_db(
                     state_db_ctx.as_deref(),
                     page,
+                    &repaired_metadata,
                 )
                 .await);
             }
@@ -686,6 +699,7 @@ impl RolloutRecorder {
             return Ok(fill_missing_thread_item_metadata_from_state_db(
                 state_db_ctx.as_deref(),
                 page,
+                &repaired_metadata,
             )
             .await);
         }
@@ -941,6 +955,35 @@ impl RolloutRecorder {
     ///
     /// This is idempotent. If materialization fails, the recorder keeps all pending items in memory
     /// and a later `persist()` or `flush()` can retry opening and writing the rollout file.
+    /// Append items and wait until the writer task has written them, combining
+    /// the append and the flush into a single writer-task round trip. Error and
+    /// recovery behavior match `record_canonical_items` followed by `flush`.
+    pub async fn record_canonical_items_flushed(
+        &self,
+        items: &[RolloutItem],
+    ) -> std::io::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(RolloutCmd::AddItemsFlushed {
+                items: items.to_vec(),
+                ack: tx,
+            })
+            .await
+            .map_err(|e| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed to queue rollout items: {e}"))
+                })
+            })?;
+        rx.await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed waiting for rollout flush: {e}"))
+            })
+        })?
+    }
+
     pub async fn persist(&self) -> std::io::Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -993,6 +1036,22 @@ impl RolloutRecorder {
                 continue;
             }
             saw_non_empty_line = true;
+            // Fast path: parse the typed line directly, skipping the Value round trip.
+            // Gated because ResponseItem's #[serde(other)] arm would successfully parse a
+            // legacy ghost_snapshot line while erasing the tag the ghost check needs, so
+            // ghost detection must happen on the raw JSON. The "\u00" gate keeps any
+            // escaped-ASCII encoding of that tag on the compatibility path, and requiring
+            // a prior thread_id keeps the unknown-history-mode rejection (which needs the
+            // raw value) ahead of the canonical SessionMeta parse. Fallback on parse
+            // failure preserves parse_errors counts and duplicate-key tolerance.
+            if thread_id.is_some()
+                && !line.contains("ghost_snapshot")
+                && !line.contains("\\u00")
+                && let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(&line)
+            {
+                items.push(rollout_line.item);
+                continue;
+            }
             let mut value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(e) => {
@@ -1168,6 +1227,7 @@ fn page_from_filesystem_scan(
 async fn fill_missing_thread_item_metadata_from_state_db(
     state_db_ctx: Option<&StateRuntime>,
     mut page: ThreadsPage,
+    repaired_metadata: &HashMap<ThreadId, codex_state::ThreadMetadata>,
 ) -> ThreadsPage {
     let Some(state_db_ctx) = state_db_ctx else {
         return page;
@@ -1177,14 +1237,20 @@ async fn fill_missing_thread_item_metadata_from_state_db(
         let Some(thread_id) = item.thread_id else {
             continue;
         };
-        let metadata = match state_db_ctx.get_thread(thread_id).await {
-            Ok(Some(metadata)) => metadata,
-            Ok(None) => continue,
-            Err(err) => {
-                warn!(
-                    "state db get_thread failed while overlaying filesystem scan thread metadata: {err}"
-                );
-                continue;
+        // Rows fetched during this page's read-repair pass are reused instead of
+        // issuing a second point SELECT per item.
+        let metadata = if let Some(metadata) = repaired_metadata.get(&thread_id) {
+            metadata.clone()
+        } else {
+            match state_db_ctx.get_thread(thread_id).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        "state db get_thread failed while overlaying filesystem scan thread metadata: {err}"
+                    );
+                    continue;
+                }
             }
         };
         fill_missing_thread_item_metadata(
@@ -1781,6 +1847,10 @@ async fn rollout_writer(
             RolloutCmd::AddItems(items) => {
                 state.add_items(items);
                 state.flush_if_materialized().await;
+            }
+            RolloutCmd::AddItemsFlushed { items, ack } => {
+                state.add_items(items);
+                let _ = ack.send(state.flush().await);
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);

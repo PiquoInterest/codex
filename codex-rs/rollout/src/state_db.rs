@@ -591,15 +591,17 @@ pub async fn reconcile_rollout(
 }
 
 /// Repair a thread's rollout path after filesystem fallback succeeds.
+/// Returns the thread's metadata row as of the fast-path repair when it is
+/// known, so list pages can reuse it instead of issuing a second point SELECT
+/// per item. Returns `None` when the slow reconcile path ran (or no state DB
+/// is available) and the row's final state is not cheaply known.
 pub async fn read_repair_rollout_path(
     context: Option<&codex_state::StateRuntime>,
     thread_id: Option<ThreadId>,
     archived_only: Option<bool>,
     rollout_path: &Path,
-) {
-    let Some(ctx) = context else {
-        return;
-    };
+) -> Option<codex_state::ThreadMetadata> {
+    let ctx = context?;
 
     // Fast path: update an existing metadata row in place, but avoid writes when
     // read-repair computes no effective change.
@@ -621,7 +623,7 @@ pub async fn read_repair_rollout_path(
             Some(true) | None => {}
         }
         if repaired == metadata {
-            return;
+            return Some(metadata);
         }
         warn!("state db discrepancy during read_repair_rollout_path: upsert_needed (fast path)");
         if let Err(err) = ctx.upsert_thread(&repaired).await {
@@ -630,7 +632,7 @@ pub async fn read_repair_rollout_path(
                 rollout_path.display()
             );
         } else {
-            return;
+            return Some(repaired);
         }
     }
 
@@ -654,6 +656,7 @@ pub async fn read_repair_rollout_path(
         /*new_thread_memory_mode*/ None,
     )
     .await;
+    None
 }
 
 /// Apply rollout items incrementally to SQLite.
