@@ -1850,6 +1850,12 @@ async fn rollout_writer(
             }
             RolloutCmd::AddItemsFlushed { items, ack } => {
                 state.add_items(items);
+                // Mirror the uncombined `AddItems` + `Flush` sequence exactly:
+                // the eager unacknowledged write keeps its own recovery retry,
+                // and the acknowledged flush gets a fresh retry budget when
+                // that write left items pending. When the eager write fully
+                // committed, the acknowledged flush is a no-op.
+                state.flush_if_materialized().await;
                 let _ = ack.send(state.flush().await);
             }
             RolloutCmd::Persist { ack } => {
