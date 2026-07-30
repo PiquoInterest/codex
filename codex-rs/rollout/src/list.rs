@@ -1,6 +1,7 @@
 #![allow(warnings, clippy::all)]
 
 use codex_utils_path as path_utils;
+use futures::future::join_all;
 use std::cmp::Reverse;
 use std::ffi::OsStr;
 use std::io;
@@ -288,11 +289,11 @@ impl<'a> RolloutFileVisitor for FilesByUpdatedAtVisitor<'a> {
         path: PathBuf,
         _scanned: usize,
     ) -> ControlFlow<()> {
-        let updated_at = file_modified_time(&path).await.unwrap_or(None);
+        // Mtimes are resolved afterwards in bounded-concurrency batches.
         self.candidates.push(ThreadCandidate {
             path,
             id,
-            updated_at,
+            updated_at: None,
         });
         ControlFlow::Continue(())
     }
@@ -560,33 +561,33 @@ async fn traverse_directories_for_paths_updated(
     let mut more_matches_available = false;
 
     let mut candidates = collect_files_by_updated_at(&root, &mut scanned_files).await?;
+    populate_candidate_mtimes(&mut candidates).await;
     candidates.sort_by_key(|candidate| {
         let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
         (Reverse(ts), Reverse(candidate.id))
     });
 
-    for candidate in candidates.into_iter() {
-        let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        if anchor_state.should_skip(ts, candidate.id) {
-            continue;
-        }
-        if items.len() == page_size {
-            more_matches_available = true;
-            break;
-        }
-
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
-        if let Some(item) = build_thread_item(
-            candidate.path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
-            updated_at_fallback,
-        )
-        .await
-        {
-            items.push(item);
-        }
+    let page_candidates: Vec<PageCandidate> = candidates
+        .into_iter()
+        .map(|candidate| PageCandidate {
+            ts: candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            id: candidate.id,
+            updated_at: CandidateUpdatedAt::Known(candidate.updated_at.and_then(format_rfc3339)),
+            path: candidate.path,
+        })
+        .collect();
+    if fill_page_from_candidates(
+        page_candidates,
+        page_size,
+        &mut anchor_state,
+        allowed_sources,
+        provider_matcher,
+        cwd_filters,
+        &mut items,
+    )
+    .await
+    {
+        more_matches_available = true;
     }
 
     let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
@@ -621,29 +622,27 @@ async fn traverse_flat_paths_created(
     let mut more_matches_available = false;
 
     let files = collect_flat_rollout_files(&root, &mut scanned_files).await?;
-    for (ts, id, path) in files.into_iter() {
-        if anchor_state.should_skip(ts, id) {
-            continue;
-        }
-        if items.len() == page_size {
-            more_matches_available = true;
-            break;
-        }
-        let updated_at = file_modified_time(&path)
-            .await
-            .unwrap_or(None)
-            .and_then(format_rfc3339);
-        if let Some(item) = build_thread_item(
+    let page_candidates: Vec<PageCandidate> = files
+        .into_iter()
+        .map(|(ts, id, path)| PageCandidate {
+            ts,
+            id,
             path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
-            updated_at,
-        )
-        .await
-        {
-            items.push(item);
-        }
+            updated_at: CandidateUpdatedAt::Stat,
+        })
+        .collect();
+    if fill_page_from_candidates(
+        page_candidates,
+        page_size,
+        &mut anchor_state,
+        allowed_sources,
+        provider_matcher,
+        cwd_filters,
+        &mut items,
+    )
+    .await
+    {
+        more_matches_available = true;
     }
 
     let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
@@ -678,33 +677,33 @@ async fn traverse_flat_paths_updated(
     let mut more_matches_available = false;
 
     let mut candidates = collect_flat_files_by_updated_at(&root, &mut scanned_files).await?;
+    populate_candidate_mtimes(&mut candidates).await;
     candidates.sort_by_key(|candidate| {
         let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
         (Reverse(ts), Reverse(candidate.id))
     });
 
-    for candidate in candidates.into_iter() {
-        let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        if anchor_state.should_skip(ts, candidate.id) {
-            continue;
-        }
-        if items.len() == page_size {
-            more_matches_available = true;
-            break;
-        }
-
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
-        if let Some(item) = build_thread_item(
-            candidate.path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
-            updated_at_fallback,
-        )
-        .await
-        {
-            items.push(item);
-        }
+    let page_candidates: Vec<PageCandidate> = candidates
+        .into_iter()
+        .map(|candidate| PageCandidate {
+            ts: candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            id: candidate.id,
+            updated_at: CandidateUpdatedAt::Known(candidate.updated_at.and_then(format_rfc3339)),
+            path: candidate.path,
+        })
+        .collect();
+    if fill_page_from_candidates(
+        page_candidates,
+        page_size,
+        &mut anchor_state,
+        allowed_sources,
+        provider_matcher,
+        cwd_filters,
+        &mut items,
+    )
+    .await
+    {
+        more_matches_available = true;
     }
 
     let reached_scan_cap = scanned_files >= MAX_SCAN_FILES;
@@ -766,6 +765,99 @@ fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cu
             ThreadId::from_string(&id.to_string()).ok()?,
         )),
         ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => Some(Cursor::new(ts)),
+    }
+}
+
+/// Bounded fan-out for per-candidate file reads while assembling a page.
+const LIST_BUILD_CONCURRENCY: usize = 16;
+
+/// How a page candidate's `updated_at` fallback is produced.
+enum CandidateUpdatedAt {
+    /// Stat the file inside the build worker.
+    Stat,
+    /// Reuse an mtime resolved during candidate collection.
+    Known(Option<String>),
+}
+
+/// One ordered page candidate for [`fill_page_from_candidates`].
+struct PageCandidate {
+    ts: OffsetDateTime,
+    id: Uuid,
+    path: PathBuf,
+    updated_at: CandidateUpdatedAt,
+}
+
+/// Fills `items` from ordered candidates, overlapping the per-file reads of up
+/// to [`LIST_BUILD_CONCURRENCY`] candidates.
+///
+/// Preserves the exact semantics of the sequential loop it replaces: items
+/// keep candidate order, anchor skipping sees the same ordered stream, and the
+/// returned `more_matches_available` is true only when at least one eligible
+/// candidate exists beyond the one that filled the page.
+async fn fill_page_from_candidates(
+    candidates: Vec<PageCandidate>,
+    page_size: usize,
+    anchor_state: &mut AnchorState,
+    allowed_sources: &[SessionSource],
+    provider_matcher: Option<&ProviderMatcher<'_>>,
+    cwd_filters: Option<&[PathBuf]>,
+    items: &mut Vec<ThreadItem>,
+) -> bool {
+    let eligible: Vec<PageCandidate> = candidates
+        .into_iter()
+        .filter(|candidate| !anchor_state.should_skip(candidate.ts, candidate.id))
+        .collect();
+    let total = eligible.len();
+    let mut processed = 0usize;
+    let mut iter = eligible.into_iter();
+    'outer: loop {
+        let batch: Vec<PageCandidate> = iter.by_ref().take(LIST_BUILD_CONCURRENCY).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let built = join_all(batch.into_iter().map(|candidate| async move {
+            let updated_at = match candidate.updated_at {
+                CandidateUpdatedAt::Stat => file_modified_time(&candidate.path)
+                    .await
+                    .unwrap_or(None)
+                    .and_then(format_rfc3339),
+                CandidateUpdatedAt::Known(updated_at) => updated_at,
+            };
+            build_thread_item(
+                candidate.path,
+                allowed_sources,
+                provider_matcher,
+                cwd_filters,
+                updated_at,
+            )
+            .await
+        }))
+        .await;
+        for item in built {
+            processed += 1;
+            if let Some(item) = item {
+                items.push(item);
+                if items.len() == page_size {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    items.len() == page_size && processed < total
+}
+
+/// Resolves candidate mtimes with bounded concurrency, in place.
+async fn populate_candidate_mtimes(candidates: &mut [ThreadCandidate]) {
+    for chunk in candidates.chunks_mut(LIST_BUILD_CONCURRENCY) {
+        let stats = join_all(
+            chunk
+                .iter()
+                .map(|candidate| file_modified_time(&candidate.path)),
+        )
+        .await;
+        for (candidate, stat) in chunk.iter_mut().zip(stats) {
+            candidate.updated_at = stat.unwrap_or(None);
+        }
     }
 }
 
@@ -1030,13 +1122,11 @@ async fn collect_flat_files_by_updated_at(
         if *scanned_files > MAX_SCAN_FILES {
             break;
         }
-        let updated_at = file_modified_time(rollout_file.path())
-            .await
-            .unwrap_or(None);
+        // Mtimes are resolved afterwards in bounded-concurrency batches.
         candidates.push(ThreadCandidate {
             path: rollout_file.into_path(),
             id,
-            updated_at,
+            updated_at: None,
         });
     }
 
