@@ -194,6 +194,15 @@ impl LiveThread {
         })
     }
 
+    /// Whether persistence telemetry measures batches appended to this thread.
+    ///
+    /// When enabled, [`Self::append_items`] records a measurement for every
+    /// raw item — including items the persistence policy drops — so callers
+    /// must not pre-filter batches based on persistability alone.
+    pub fn persistence_telemetry_enabled(&self) -> bool {
+        self.persistence_telemetry.is_enabled()
+    }
+
     #[tracing::instrument(
         level = "trace",
         skip_all,

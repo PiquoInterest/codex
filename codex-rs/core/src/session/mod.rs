@@ -878,6 +878,20 @@ fn new_submission_id() -> String {
     Uuid::now_v7().to_string()
 }
 
+/// Whether an event must go through the persistence stack rather than being
+/// delivered directly.
+///
+/// Never-persisted events (per-token streaming deltas) may skip the stack as a
+/// fast path, but only while persistence telemetry is not measuring this
+/// thread: the telemetry records `decision=dropped` measurements for exactly
+/// those events, so bypassing the stack would silently lose them.
+fn event_requires_persistence_stack(
+    msg: &EventMsg,
+    persistence_telemetry_enabled: impl FnOnce() -> bool,
+) -> bool {
+    codex_rollout::is_event_msg_ever_persisted(msg) || persistence_telemetry_enabled()
+}
+
 fn get_service_tier(
     configured_service_tier: Option<String>,
     fast_mode_enabled: bool,
@@ -1161,6 +1175,11 @@ impl Session {
 
     pub(crate) fn live_thread(&self) -> Option<&LiveThread> {
         self.services.live_thread.as_ref()
+    }
+
+    fn persistence_telemetry_enabled(&self) -> bool {
+        self.live_thread()
+            .is_some_and(LiveThread::persistence_telemetry_enabled)
     }
 
     pub(crate) async fn set_thread_memory_mode(
@@ -2068,7 +2087,11 @@ impl Session {
         // Persist the event into rollout storage; the store applies its persistence policy.
         // Events no history mode persists (e.g. per-token streaming deltas) skip the
         // clone and thread-store round trip entirely to keep the delta path cheap.
-        if persist && codex_rollout::is_event_msg_ever_persisted(&event.msg) {
+        // Persistence telemetry measures dropped items too, so when it is enabled for
+        // this thread every event must still reach the persistence stack.
+        if persist
+            && event_requires_persistence_stack(&event.msg, || self.persistence_telemetry_enabled())
+        {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
             self.persist_rollout_items(&rollout_items).await;
         }

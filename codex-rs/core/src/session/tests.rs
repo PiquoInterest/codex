@@ -11636,3 +11636,39 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 
     Ok(())
 }
+
+#[test]
+fn delta_events_skip_persistence_stack_only_while_telemetry_is_off() {
+    let delta = EventMsg::AgentMessageContentDelta(
+        codex_protocol::protocol::AgentMessageContentDeltaEvent {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            delta: "chunk".to_string(),
+        },
+    );
+
+    // Fast path: nothing is measuring, so a never-persisted delta may bypass
+    // the persistence stack.
+    assert!(!event_requires_persistence_stack(&delta, || false));
+
+    // Persistence telemetry measures dropped items, so an enabled thread must
+    // route deltas through the stack even though no history mode stores them.
+    assert!(event_requires_persistence_stack(&delta, || true));
+}
+
+#[test]
+fn persisted_events_require_persistence_stack_without_consulting_telemetry() {
+    let persisted = EventMsg::UserMessage(UserMessageEvent {
+        client_id: None,
+        message: "hello".to_string(),
+        images: None,
+        text_elements: Vec::new(),
+        local_images: Vec::new(),
+        ..Default::default()
+    });
+
+    assert!(event_requires_persistence_stack(&persisted, || {
+        panic!("telemetry state must not be consulted for persisted events")
+    }));
+}
