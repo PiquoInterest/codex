@@ -49,7 +49,11 @@ use std::os::unix::fs::PermissionsExt;
 
 /// Filename that stores the message history inside `~/.codex`.
 const HISTORY_FILENAME: &str = "history.jsonl";
-const HISTORY_READ_BUFFER_SIZE: usize = 256 * 1024;
+const HISTORY_READ_BUFFER_SIZE: usize = 8192;
+/// Larger buffer for the whole-file newline count at thread open; the batch
+/// scanner keeps the smaller buffer, which its chunk-stitching tests and
+/// stack-allocated read path are sized around.
+const HISTORY_COUNT_BUFFER_SIZE: usize = 256 * 1024;
 
 /// When history exceeds the hard cap, trim it down to this fraction of `max_bytes`.
 const HISTORY_SOFT_CAP_RATIO: f64 = 0.8;
@@ -337,7 +341,7 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
             Err(_) => return 0,
         };
 
-        let mut buf = vec![0u8; HISTORY_READ_BUFFER_SIZE];
+        let mut buf = vec![0u8; HISTORY_COUNT_BUFFER_SIZE];
         let mut count = 0usize;
         loop {
             match file.read(&mut buf) {

@@ -160,3 +160,19 @@ fn scans_record_spanning_three_read_chunks() -> std::io::Result<()> {
 
     assert_records(&mut scanner, &["third", &large_value, "first"])
 }
+
+#[test]
+fn in_chunk_records_do_not_use_the_reassembly_buffer() -> std::io::Result<()> {
+    let input = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&record("first"))?,
+        serde_json::to_string(&record("second"))?
+    );
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?;
+
+    assert_records(&mut scanner, &["second", "first"])?;
+    // A capacity of zero proves the scratch buffer never allocated: both
+    // records were parsed directly from the read chunk.
+    assert_eq!(scanner.record_reversed.capacity(), 0);
+    Ok(())
+}

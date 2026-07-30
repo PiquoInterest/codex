@@ -45,12 +45,12 @@ async fn lookup_reads_history_entries() {
 async fn history_metadata_counts_newlines_across_read_boundaries() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let history_path = temp_dir.path().join(HISTORY_FILENAME);
-    let mut contents = vec![b'x'; 3 * HISTORY_READ_BUFFER_SIZE + 1];
+    let mut contents = vec![b'x'; 3 * HISTORY_COUNT_BUFFER_SIZE + 1];
     let newline_offsets = [
         0,
-        HISTORY_READ_BUFFER_SIZE - 1,
-        HISTORY_READ_BUFFER_SIZE,
-        2 * HISTORY_READ_BUFFER_SIZE,
+        HISTORY_COUNT_BUFFER_SIZE - 1,
+        HISTORY_COUNT_BUFFER_SIZE,
+        2 * HISTORY_COUNT_BUFFER_SIZE,
         contents.len() - 2,
     ];
     for offset in newline_offsets {
