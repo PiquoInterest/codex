@@ -737,6 +737,11 @@ mod tests {
             .await
             .expect("read auto_vacuum pragma");
         assert_eq!(auto_vacuum, 2);
+        let journal_size_limit = sqlx::query_scalar::<_, i64>("PRAGMA journal_size_limit")
+            .fetch_one(&pool)
+            .await
+            .expect("read journal_size_limit pragma");
+        assert_eq!(journal_size_limit, 16_777_216);
         pool.close().await;
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
