@@ -312,3 +312,66 @@ async fn foreign_history_files_are_ignored() {
     let entry = lookup(log_id, 0, &config).expect("entry resolves");
     assert_eq!(entry.text, "only");
 }
+
+/// Manual write-amplification probe: appends a fixed corpus under a byte cap
+/// and reports kernel-attributed write bytes. Run explicitly:
+/// `cargo test --release -p codex-message-history -- --ignored --nocapture bench_append_storm`
+#[tokio::test]
+#[ignore = "manual benchmark, reports via --nocapture"]
+async fn bench_append_storm_write_bytes() {
+    use std::io::Read;
+    fn proc_write_bytes() -> u64 {
+        let mut s = String::new();
+        std::fs::File::open("/proc/self/io")
+            .expect("open /proc/self/io")
+            .read_to_string(&mut s)
+            .expect("read /proc/self/io");
+        s.lines()
+            .find_map(|l| l.strip_prefix("write_bytes: "))
+            .expect("write_bytes field")
+            .parse()
+            .expect("parse write_bytes")
+    }
+
+    let n: usize = std::env::var("HISTBENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    let cap: usize = std::env::var("HISTBENCH_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_048_576);
+
+    let codex_home = TempDir::new().expect("create temp dir");
+    let history = History {
+        max_bytes: Some(cap),
+        ..History::default()
+    };
+    let config = HistoryConfig::new(codex_home.path(), &history);
+    let entry = "x".repeat(150);
+
+    let start = std::time::Instant::now();
+    let before = proc_write_bytes();
+    for _ in 0..n {
+        append_entry(&entry, "bench", &config)
+            .await
+            .expect("append entry");
+    }
+    let after = proc_write_bytes();
+
+    let retained: u64 = std::fs::read_dir(codex_home.path())
+        .expect("read dir")
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.len())
+        .sum();
+    let files = std::fs::read_dir(codex_home.path())
+        .expect("read dir")
+        .count();
+    println!(
+        "bench_append_storm: appends={n} cap={cap} write_bytes={} elapsed_ms={} retained_bytes={retained} files={files}",
+        after - before,
+        start.elapsed().as_millis(),
+    );
+}
