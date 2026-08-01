@@ -164,7 +164,11 @@ pub struct ResponsesStreamEvent {
     pub(crate) headers: Option<Value>,
     metadata: Option<Value>,
     response: Option<Value>,
-    item: Option<Value>,
+    /// Raw item payload, deferred so the (potentially large) item JSON is
+    /// lexed once straight into `ResponseItem` instead of through a `Value`
+    /// DOM round trip. Requires deserializing events from string input,
+    /// which both the SSE and websocket paths do.
+    item: Option<Box<serde_json::value::RawValue>>,
     item_id: Option<String>,
     call_id: Option<String>,
     delta: Option<String>,
@@ -330,7 +334,7 @@ pub fn process_responses_event(
     match event.kind.as_str() {
         "response.output_item.done" => {
             if let Some(item_val) = event.item {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
+                if let Ok(item) = serde_json::from_str::<ResponseItem>(item_val.get()) {
                     return Ok(Some(ResponseEvent::OutputItemDone(item)));
                 }
                 debug!("failed to parse ResponseItem from output_item.done");
@@ -451,7 +455,7 @@ pub fn process_responses_event(
         }
         "response.output_item.added" => {
             if let Some(item_val) = event.item {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
+                if let Ok(item) = serde_json::from_str::<ResponseItem>(item_val.get()) {
                     return Ok(Some(ResponseEvent::OutputItemAdded(item)));
                 }
                 debug!("failed to parse ResponseItem from output_item.added");

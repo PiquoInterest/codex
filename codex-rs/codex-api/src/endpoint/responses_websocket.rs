@@ -717,20 +717,26 @@ async fn run_websocket_response_stream(
 
         match message {
             Message::Text(text) => {
-                if let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
+                let event = match serde_json::from_str::<ResponsesStreamEvent>(&text) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        if let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
+                            && let Some(error) =
+                                map_wrapped_websocket_error_event(wrapped_error, text.to_string())
+                        {
+                            return Err(error);
+                        }
+                        debug!("failed to parse websocket event: {err}, data: {text}");
+                        continue;
+                    }
+                };
+                if event.kind() == "error"
+                    && let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
                     && let Some(error) =
                         map_wrapped_websocket_error_event(wrapped_error, text.to_string())
                 {
                     return Err(error);
                 }
-
-                let event = match serde_json::from_str::<ResponsesStreamEvent>(&text) {
-                    Ok(event) => event,
-                    Err(err) => {
-                        debug!("failed to parse websocket event: {err}, data: {text}");
-                        continue;
-                    }
-                };
                 emit_responses_websocket_timing_event(
                     event.kind(),
                     text.as_str(),
@@ -925,7 +931,8 @@ mod tests {
                 }],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
-            }],
+            }]
+            .into(),
             tools: Some(
                 Arc::<RawValue>::from(
                     to_raw_value(&vec![json!({

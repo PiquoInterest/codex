@@ -58,6 +58,10 @@ pub fn default_filter() -> Targets {
         .with_target("codex_otel.log_only", LevelFilter::OFF)
         .with_target("codex_otel.trace_safe", LevelFilter::OFF)
         .with_target("rmcp::service", LevelFilter::INFO)
+        // Streaming responses log every raw SSE frame at TRACE (one full JSON
+        // payload per token delta); keep those out of the persistent sink by
+        // default so streamed turns do not write per-token rows to SQLite.
+        .with_target("codex_api::sse", LevelFilter::DEBUG)
         .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
         .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF)
 }
@@ -432,8 +436,8 @@ async fn flush(state_db: &StateRuntime, buffer: &mut Vec<LogEntry>) {
     if buffer.is_empty() {
         return;
     }
-    let entries = buffer.split_off(0);
-    let _ = state_db.insert_logs(entries.as_slice()).await;
+    let _ = state_db.insert_logs(buffer.as_slice()).await;
+    buffer.clear();
 }
 
 #[derive(Default)]
@@ -444,10 +448,11 @@ struct MessageVisitor {
 
 impl MessageVisitor {
     fn record_field(&mut self, field: &Field, value: String) {
-        if field.name() == "message" && self.message.is_none() {
-            self.message = Some(value.clone());
-        }
-        if field.name() == "thread_id" && self.thread_id.is_none() {
+        if field.name() == "message" {
+            if self.message.is_none() {
+                self.message = Some(value);
+            }
+        } else if field.name() == "thread_id" && self.thread_id.is_none() {
             self.thread_id = Some(value);
         }
     }

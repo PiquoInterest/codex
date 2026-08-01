@@ -15,6 +15,7 @@ use super::MAX_RETRIES;
 use super::RETRY_SLEEP;
 use super::history_filepath;
 use super::log_identity;
+use super::segments::SegmentSet;
 
 const MAX_BATCH_ROWS: usize = 128;
 const MAX_BATCH_BYTES: usize = 64 * 1024;
@@ -114,15 +115,94 @@ pub fn lookup_batch(
     config: &HistoryConfig,
 ) -> std::io::Result<HistoryBatch> {
     let path = history_filepath(config);
-    let mut file = OpenOptions::new().read(true).open(path)?;
-    let current_log_id = log_identity(&file.metadata()?).unwrap_or(0);
-    if log_id != 0 && current_log_id != log_id {
+    let Some(dir) = path.parent() else {
         return Ok(HistoryBatch::default());
+    };
+    let set = SegmentSet::scan(dir);
+
+    let active = OpenOptions::new().read(true).open(&path);
+    let active_id = active
+        .as_ref()
+        .ok()
+        .and_then(|file| file.metadata().ok())
+        .and_then(|metadata| log_identity(&metadata));
+
+    if log_id != 0 && active_id != Some(log_id) && active_id.is_some() {
+        // The caller's identifier predates a rotation and now names a frozen
+        // segment; offsets in this cursor are local to that file.
+        let Some(segment) = set.segments.iter().find(|segment| {
+            std::fs::metadata(&segment.path)
+                .ok()
+                .and_then(|metadata| log_identity(&metadata))
+                == Some(log_id)
+        }) else {
+            return Ok(HistoryBatch::default());
+        };
+        let Ok(mut file) = std::fs::OpenOptions::new().read(true).open(&segment.path) else {
+            return Ok(HistoryBatch::default());
+        };
+        return scan_batch(&mut file, cursor, config);
     }
 
+    // Global resolution: offsets count from the oldest retained entry across
+    // rotated segments plus the active file. Batches never span files; a
+    // batch that exhausts one file hands back a plain-offset cursor pointing
+    // into the next older segment.
+    let active_start = usize::try_from(set.active_start()).unwrap_or(usize::MAX);
+    let mut cursor = cursor;
+    if cursor.end_offset >= active_start {
+        match active {
+            Ok(mut file) => {
+                let local_cursor = HistoryBatchCursor {
+                    end_offset: cursor.end_offset - active_start,
+                    byte_anchor: cursor.byte_anchor,
+                };
+                let batch = lock_and_scan(&mut file, local_cursor, config)?;
+                if !batch.entries.is_empty() || active_start == 0 {
+                    return Ok(rebase_batch(batch, active_start, set.segments.len()));
+                }
+                // The active file exists but holds no rows (typically right
+                // after a rotation); continue into the newest segment so the
+                // caller still makes progress.
+            }
+            Err(error) => {
+                if active_start == 0 {
+                    return Err(error);
+                }
+                // No active file right after a rotation: the newest rows live
+                // in the newest segment.
+            }
+        }
+        cursor = HistoryBatchCursor::new(active_start - 1);
+    }
+
+    let Some((index, local)) = set.locate(cursor.end_offset as u64) else {
+        return Ok(HistoryBatch::default());
+    };
+    let segment = &set.segments[index];
+    let base = usize::try_from(segment.start).unwrap_or(usize::MAX);
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).open(&segment.path) else {
+        // The segment was deleted by concurrent cap enforcement; the rows it
+        // held are gone, matching a trimmed prefix under the old scheme.
+        return Ok(HistoryBatch::default());
+    };
+    let local_cursor = HistoryBatchCursor {
+        end_offset: usize::try_from(local).unwrap_or(usize::MAX),
+        byte_anchor: cursor.byte_anchor,
+    };
+    let batch = lock_and_scan(&mut file, local_cursor, config)?;
+    Ok(rebase_batch(batch, base, index))
+}
+
+/// Acquires the shared lock with bounded retries, then scans one file.
+fn lock_and_scan(
+    file: &mut File,
+    cursor: HistoryBatchCursor,
+    config: &HistoryConfig,
+) -> std::io::Result<HistoryBatch> {
     for _ in 0..MAX_RETRIES {
         match file.try_lock_shared() {
-            Ok(()) => return scan_batch(&mut file, cursor, config),
+            Ok(()) => return scan_batch(file, cursor, config),
             Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(RETRY_SLEEP),
             Err(error) => return Err(error.into()),
         }
@@ -132,6 +212,25 @@ pub fn lookup_batch(
         std::io::ErrorKind::WouldBlock,
         "could not acquire shared history lock after multiple attempts",
     ))
+}
+
+/// Shifts a single-file batch into global offsets.
+///
+/// `older_files` is the number of files older than the scanned one; when the
+/// scan exhausted its file and older files remain, the continuation cursor
+/// becomes a plain offset pointing at the newest row of the next older file.
+fn rebase_batch(mut batch: HistoryBatch, base: usize, older_files: usize) -> HistoryBatch {
+    for entry in &mut batch.entries {
+        entry.offset = entry.offset.saturating_add(base);
+    }
+    match &mut batch.next_older_cursor {
+        Some(cursor) => cursor.end_offset = cursor.end_offset.saturating_add(base),
+        None if base > 0 && older_files > 0 => {
+            batch.next_older_cursor = Some(HistoryBatchCursor::new(base - 1));
+        }
+        None => {}
+    }
+    batch
 }
 
 /// Selects the anchored backward scan only for an unchanged, uncapped history file.

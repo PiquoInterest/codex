@@ -82,6 +82,17 @@ pub fn should_persist_response_item_for_memories(item: &ResponseItem) -> bool {
     }
 }
 
+/// Whether an `EventMsg` is persisted under any thread history mode.
+///
+/// Hot event paths use this to skip persistence plumbing entirely for events
+/// that every mode discards (e.g. per-token streaming deltas). Delegates to
+/// [`should_persist_event_msg`] so it cannot drift from the per-mode policy.
+#[inline]
+pub fn is_event_msg_ever_persisted(ev: &EventMsg) -> bool {
+    should_persist_event_msg(ev, ThreadHistoryMode::Legacy)
+        || should_persist_event_msg(ev, ThreadHistoryMode::Paginated)
+}
+
 /// Whether an `EventMsg` should be persisted in rollout files.
 #[inline]
 pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) -> bool {

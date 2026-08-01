@@ -112,10 +112,16 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     request: GuardianApprovalRequest,
     mode: GuardianPromptMode,
 ) -> serde_json::Result<GuardianPromptItems> {
-    let history = session.clone_history().await;
-    let transcript_entries = collect_guardian_transcript_entries(history.raw_items());
+    let (transcript_entries, parent_history_version) = session
+        .with_history(|history| {
+            (
+                collect_guardian_transcript_entries(history.raw_items()),
+                history.history_version(),
+            )
+        })
+        .await;
     let transcript_cursor = GuardianTranscriptCursor {
-        parent_history_version: history.history_version(),
+        parent_history_version,
         transcript_entry_count: transcript_entries.len(),
     };
     let planned_action_json = format_guardian_action_pretty(&request)?;

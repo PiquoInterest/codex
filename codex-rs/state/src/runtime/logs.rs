@@ -1,6 +1,14 @@
 use super::*;
 
 const LOG_RETENTION_DAYS: i64 = 10;
+/// Maximum freelist pages reclaimed per startup maintenance pass.
+///
+/// Incremental auto-vacuum only moves freed pages to the freelist; nothing
+/// shrinks the database from its high-water mark unless `incremental_vacuum`
+/// runs. Bounding the page count keeps the reclaim from stalling startup
+/// behind a large backlog (2,048 pages is at most 8 MiB at the default page
+/// size); a backlog larger than the budget drains across future startups.
+const LOG_VACUUM_PAGE_BUDGET: i64 = 2048;
 
 impl StateRuntime {
     pub async fn insert_log(&self, entry: &LogEntry) -> anyhow::Result<()> {
@@ -300,6 +308,10 @@ WHERE id IN (
             return Ok(());
         };
         self.delete_logs_before(cutoff.timestamp()).await?;
+        let mut vacuum = QueryBuilder::<Sqlite>::new("PRAGMA incremental_vacuum(");
+        vacuum.push(LOG_VACUUM_PAGE_BUDGET);
+        vacuum.push(")");
+        vacuum.build().execute(self.logs_pool.as_ref()).await?;
         // Startup cleanup should not wait behind or block foreground work.
         // PASSIVE checkpoints copy whatever is immediately available and skip
         // frames that would require waiting on active readers or writers.
@@ -725,6 +737,74 @@ mod tests {
             .await
             .expect("read auto_vacuum pragma");
         assert_eq!(auto_vacuum, 2);
+        let journal_size_limit = sqlx::query_scalar::<_, i64>("PRAGMA journal_size_limit")
+            .fetch_one(&pool)
+            .await
+            .expect("read journal_size_limit pragma");
+        assert_eq!(journal_size_limit, 16_777_216);
+        pool.close().await;
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn startup_maintenance_reclaims_freelist_pages() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
+
+        let entries: Vec<LogEntry> = (0..64)
+            .map(|idx| LogEntry {
+                ts: 1,
+                ts_nanos: idx,
+                level: "INFO".to_string(),
+                target: "cli".to_string(),
+                message: Some("x".repeat(16 * 1024)),
+                feedback_log_body: Some("x".repeat(16 * 1024)),
+                thread_id: None,
+                process_uuid: None,
+                module_path: None,
+                file: Some("main.rs".to_string()),
+                line: Some(idx),
+            })
+            .collect();
+        runtime.insert_logs(&entries).await.expect("insert logs");
+
+        let deleted = runtime
+            .delete_logs_before(i64::MAX)
+            .await
+            .expect("delete expired logs");
+        assert_eq!(deleted, 64);
+
+        let logs_path =
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()).logs_db_path();
+        let pool = open_db_pool(logs_path.as_path()).await;
+        let freelist_before = sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+            .fetch_one(&pool)
+            .await
+            .expect("read freelist before maintenance");
+        assert!(
+            freelist_before > 0,
+            "deleting bulky rows should leave freelist pages to reclaim"
+        );
+
+        runtime
+            .run_logs_startup_maintenance()
+            .await
+            .expect("run startup maintenance");
+
+        let freelist_after = sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+            .fetch_one(&pool)
+            .await
+            .expect("read freelist after maintenance");
+        assert!(
+            freelist_after < freelist_before,
+            "bounded incremental vacuum should reclaim freelist pages              (before: {freelist_before}, after: {freelist_after})"
+        );
         pool.close().await;
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;

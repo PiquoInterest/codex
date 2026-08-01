@@ -30,11 +30,7 @@ pub(super) async fn create_thread(
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let history_mode = params.history_mode;
     store.ensure_live_recorder_absent(thread_id).await?;
-    let writer_lock = if matches!(history_mode, ThreadHistoryMode::Paginated) {
-        Some(store.writer_lock_coordinator.acquire(thread_id)?)
-    } else {
-        None
-    };
+    let writer_lock = store.writer_lock_coordinator.acquire(thread_id)?;
     let recorder = create_thread::create_thread(store, params).await?;
     store
         .insert_live_recorder(thread_id, recorder, history_mode, writer_lock)
@@ -47,6 +43,7 @@ pub(super) async fn resume_thread(
 ) -> ThreadStoreResult<()> {
     let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
+    let writer_lock = store.writer_lock_coordinator.acquire(params.thread_id)?;
     let history_mode = if let Some(history) = params.history.as_deref() {
         canonical_history_mode_from_rollout_items(history)
     } else if let Some(rollout_path) = params.rollout_path.as_ref() {
@@ -102,11 +99,6 @@ pub(super) async fn resume_thread(
         cwd,
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
-    };
-    let writer_lock = if matches!(history_mode, ThreadHistoryMode::Paginated) {
-        Some(store.writer_lock_coordinator.acquire(params.thread_id)?)
-    } else {
-        None
     };
     let recorder = RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path))
         .await
@@ -178,6 +170,7 @@ pub(super) async fn shutdown_thread(
         let _ = metrics.histogram(ROLLOUT_SIZE_BYTES_METRIC, size_bytes, &[]);
     }
     store.live_recorders.lock().await.remove(&thread_id);
+    store.evict_rollout_head_cache(thread_id).await;
     Ok(())
 }
 
@@ -186,6 +179,7 @@ pub(super) async fn discard_thread(
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    store.evict_rollout_head_cache(thread_id).await;
     store
         .live_recorders
         .lock()
@@ -332,13 +326,10 @@ async fn write_and_project(
 
 async fn durable_write(recorder: &RolloutRecorder, write: RolloutWriteOp) -> ThreadStoreResult<()> {
     match write {
-        RolloutWriteOp::AppendItems(items) => {
-            recorder
-                .record_canonical_items(items.as_slice())
-                .await
-                .map_err(thread_store_io_error)?;
-            recorder.flush().await.map_err(thread_store_io_error)
-        }
+        RolloutWriteOp::AppendItems(items) => recorder
+            .record_canonical_items_flushed(items.as_slice())
+            .await
+            .map_err(thread_store_io_error),
         RolloutWriteOp::Persist => recorder.persist().await.map_err(thread_store_io_error),
         RolloutWriteOp::Flush => recorder.flush().await.map_err(thread_store_io_error),
     }

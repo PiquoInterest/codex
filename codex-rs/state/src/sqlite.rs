@@ -253,6 +253,11 @@ impl SqliteConfig {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .auto_vacuum(SqliteAutoVacuum::Incremental)
+            // Caps the WAL file retained after a truncating checkpoint. This is
+            // not a bound on a live WAL: while a reader pins the log the WAL
+            // still grows as needed, and only the post-checkpoint remainder is
+            // truncated down to this limit.
+            .pragma("journal_size_limit", "16777216")
             .busy_timeout(Duration::from_secs(5))
             .log_statements(LevelFilter::Off);
         SqlitePoolOptions::new()

@@ -1,4 +1,6 @@
 use crate::error::ApiError;
+use std::borrow::Cow;
+
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
@@ -249,11 +251,17 @@ impl Serialize for ResponsesApiTools {
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
-pub struct ResponsesApiRequest {
+pub struct ResponsesApiRequest<'a> {
     pub model: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
-    pub input: Vec<ResponseItem>,
+    /// Conversation input items.
+    ///
+    /// Borrowed when the caller's items can go on the wire unmodified, so the
+    /// common request path avoids deep-cloning the full conversation history;
+    /// owned when the caller had to transform items (or must mutate or retain
+    /// them, as the websocket reuse path does).
+    pub input: Cow<'a, [ResponseItem]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ResponsesApiTools>,
     pub tool_choice: String,
@@ -274,13 +282,54 @@ pub struct ResponsesApiRequest {
     pub client_metadata: Option<HashMap<String, String>>,
 }
 
-impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
-    fn from(request: &'a ResponsesApiRequest) -> Self {
+impl ResponsesApiRequest<'_> {
+    /// Converts the request into one that owns its input items, cloning them
+    /// only when they are currently borrowed.
+    pub fn into_owned_input(self) -> ResponsesApiRequest<'static> {
+        let ResponsesApiRequest {
+            model,
+            instructions,
+            input,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            reasoning,
+            store,
+            stream,
+            stream_options,
+            include,
+            service_tier,
+            prompt_cache_key,
+            text,
+            client_metadata,
+        } = self;
+        ResponsesApiRequest {
+            model,
+            instructions,
+            input: Cow::Owned(input.into_owned()),
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            reasoning,
+            store,
+            stream,
+            stream_options,
+            include,
+            service_tier,
+            prompt_cache_key,
+            text,
+            client_metadata,
+        }
+    }
+}
+
+impl<'a> From<&'a ResponsesApiRequest<'_>> for ResponseCreateWsRequest<'a> {
+    fn from(request: &'a ResponsesApiRequest<'_>) -> Self {
         Self {
             model: &request.model,
             instructions: &request.instructions,
             previous_response_id: None,
-            input: &request.input,
+            input: request.input.as_ref(),
             tools: request.tools.as_ref().map(ResponsesApiTools::as_raw_value),
             tool_choice: &request.tool_choice,
             parallel_tool_calls: request.parallel_tool_calls,

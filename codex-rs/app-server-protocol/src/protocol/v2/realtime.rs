@@ -1,3 +1,5 @@
+use crate::JsonSchema;
+use crate::TS;
 use codex_protocol::protocol::CodexResponseHandoffMode;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeAudioFrame as CoreRealtimeAudioFrame;
@@ -5,12 +7,10 @@ use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
-use ts_rs::TS;
 
 /// EXPERIMENTAL - thread realtime audio chunk.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -106,6 +106,12 @@ pub struct ThreadRealtimeStartParams {
     /// limited to 128 items and 8,192 estimated text tokens in total.
     #[ts(optional = nullable)]
     pub initial_items: Option<Vec<ThreadRealtimeInitialItem>>,
+    /// Developer instructions given to the backing Codex model when this realtime session starts.
+    #[ts(optional = nullable)]
+    pub realtime_start_instructions: Option<String>,
+    /// Developer instructions given to the backing Codex model when this realtime session ends.
+    #[ts(optional = nullable)]
+    pub realtime_end_instructions: Option<String>,
     #[serde(
         default,
         deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
