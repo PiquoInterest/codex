@@ -78,7 +78,52 @@ pub fn parse_powershell_command_into_plain_commands(
     command: &[String],
 ) -> Option<Vec<Vec<String>>> {
     let (executable, script) = extract_powershell_command(command)?;
-    try_parse_powershell_ast_commands(executable, script)
+    let executable = trusted_powershell_parser_executable(executable)?;
+    try_parse_powershell_ast_commands(executable.to_str()?, script)
+}
+
+#[cfg(windows)]
+fn trusted_powershell_parser_executable(executable: &str) -> Option<PathBuf> {
+    let executable_path = std::path::Path::new(executable);
+    let executable_name = executable_path
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .to_ascii_lowercase();
+    if !matches!(
+        executable_name.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        return None;
+    }
+
+    let executable_path = executable_path.canonicalize().ok()?;
+    trusted_powershell_parser_roots()
+        .into_iter()
+        .any(|root| executable_path.starts_with(root))
+        .then_some(executable_path)
+}
+
+#[cfg(not(windows))]
+fn trusted_powershell_parser_executable(executable: &str) -> Option<PathBuf> {
+    Some(PathBuf::from(executable))
+}
+
+#[cfg(windows)]
+fn trusted_powershell_parser_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for path in [
+        std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r#"C:\Windows"#))
+            .join(r#"System32\WindowsPowerShell\v1.0"#),
+        PathBuf::from(r#"C:\Program Files\PowerShell"#),
+        PathBuf::from(r#"C:\Program Files (x86)\PowerShell"#),
+    ] {
+        if let Ok(path) = path.canonicalize() {
+            roots.push(path);
+        }
+    }
+    roots
 }
 
 /// This function attempts to find a powershell.exe executable on the system.
@@ -154,6 +199,10 @@ mod tests {
     use super::extract_powershell_command;
     #[cfg(windows)]
     use super::parse_powershell_command_into_plain_commands;
+    #[cfg(windows)]
+    use super::trusted_powershell_parser_executable;
+    #[cfg(windows)]
+    use std::path::PathBuf;
 
     #[test]
     fn extracts_basic_powershell_command() {
@@ -203,10 +252,41 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn trusted_windows_powershell() -> String {
+        let powershell = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r#"C:\Windows"#))
+            .join(r#"System32\WindowsPowerShell\v1.0\powershell.exe"#);
+        trusted_powershell_parser_executable(&powershell.to_string_lossy())
+            .expect("trusted PowerShell")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn does_not_parse_untrusted_powershell_path() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("codex-untrusted-powershell-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let untrusted = temp_dir.join("powershell.exe");
+        std::fs::write(&untrusted, b"").expect("write untrusted powershell");
+        let commands = parse_powershell_command_into_plain_commands(&[
+            untrusted.to_string_lossy().to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "echo hi".to_string(),
+        ]);
+        std::fs::remove_dir_all(temp_dir).expect("remove temp dir");
+
+        assert_eq!(commands, None);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn parses_plain_powershell_commands() {
         let commands = parse_powershell_command_into_plain_commands(&[
-            "powershell.exe".to_string(),
+            trusted_windows_powershell(),
             "-NoProfile".to_string(),
             "-Command".to_string(),
             "echo hi".to_string(),
@@ -220,7 +300,7 @@ mod tests {
     #[test]
     fn parses_multiple_plain_powershell_commands() {
         let commands = parse_powershell_command_into_plain_commands(&[
-            "powershell.exe".to_string(),
+            trusted_windows_powershell(),
             "-NoProfile".to_string(),
             "-Command".to_string(),
             "Write-Output foo | Measure-Object".to_string(),
