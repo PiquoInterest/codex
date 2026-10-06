@@ -47,7 +47,8 @@ impl Handler {
         let arguments = function_arguments(payload)?;
         let args: SendInputArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = parse_agent_id_target(&args.target)?;
-        let input_items = parse_collab_input(args.message, args.items)?;
+        let mut input_items = parse_collab_input(args.message, args.items)?;
+        validate_collab_local_media_paths(&mut input_items, turn.as_ref())?;
         let prompt = render_input_preview(&input_items);
         let local_agent_control = session
             .services
