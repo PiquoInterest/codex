@@ -68,7 +68,8 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
-    let input_items = parse_collab_input(args.message, args.items)?;
+    let mut input_items = parse_collab_input(args.message, args.items)?;
+    validate_collab_local_media_paths(&mut input_items, turn)?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);

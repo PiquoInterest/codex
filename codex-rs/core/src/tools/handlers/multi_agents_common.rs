@@ -1,3 +1,4 @@
+use crate::TurnContext;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
@@ -187,4 +188,60 @@ pub(crate) fn parse_collab_input(
             Ok(items)
         }
     }
+}
+
+/// Ensure local media forwarded between agents is readable under the sender's
+/// active filesystem profile, and pin the checked target to prevent a later
+/// serialization step from following a model-supplied symlink elsewhere.
+pub(crate) fn validate_collab_local_media_paths(
+    input_items: &mut [UserInput],
+    turn: &TurnContext,
+) -> Result<(), FunctionCallError> {
+    let has_local_media = input_items.iter().any(|item| {
+        matches!(
+            item,
+            UserInput::LocalAudio { .. } | UserInput::LocalImage { .. }
+        )
+    });
+    if !has_local_media {
+        return Ok(());
+    }
+
+    let permission_profile = turn.permission_profile();
+    if matches!(
+        &permission_profile,
+        codex_protocol::models::PermissionProfile::External { .. }
+    ) {
+        return Err(FunctionCallError::RespondToModel(
+            "Local media files cannot be checked under an external filesystem sandbox.".into(),
+        ));
+    }
+
+    let file_system_policy = permission_profile.file_system_sandbox_policy();
+    let cwd = turn.config.cwd.as_path();
+    for item in input_items {
+        let path = match item {
+            UserInput::LocalAudio { path } | UserInput::LocalImage { path, .. } => path,
+            _ => continue,
+        };
+        let absolute_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path.as_path())
+        };
+        let resolved_path = absolute_path.canonicalize().map_err(|_| {
+            FunctionCallError::RespondToModel(
+                "Local media file is unavailable under the current filesystem permissions.".into(),
+            )
+        })?;
+        if !file_system_policy.can_read_local_path_with_cwd(&resolved_path, cwd) {
+            return Err(FunctionCallError::RespondToModel(
+                "Local media file access is denied by the current filesystem permissions.".into(),
+            ));
+        }
+
+        *path = resolved_path;
+    }
+
+    Ok(())
 }
